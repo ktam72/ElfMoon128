@@ -10,7 +10,12 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.switch_layers import _gather_sort, _scatter_unsort
 from expert_store import BITS, GROUP, ExpertStore
-from resident_cache import ResidentCache
+from resident_cache import (
+    DEFAULT_HEADROOM,
+    ResidentCache,
+    budget_bytes_from_env,
+    plan_cache_experts,
+)
 from slot_cache import GlobalSlotCache, _SENTINEL
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -748,9 +753,82 @@ def _read_routing_config(model_path=None):
         return "softmax", 1.0
 
 
+#: 予算導出まで使う暫定容量。実容量は autotune_capacity() で確定する。
+_PROVISIONAL_CAPACITY = 4096
+
+
+def _make_cache(capacity, perf):
+    """常駐キャッシュを生成する。
+
+    capacity が None のときは autotune_capacity() による予算導出モードに入り、
+    ここでは暫定容量で構築する（非 expert 重みの実測が非 expert 解放後まで
+    できないため）。明示指定時はその値をそのまま使う。
+    """
+    if capacity is None:
+        return ResidentCache(_PROVISIONAL_CAPACITY)
+    eff_cap = max(capacity, 8000) if perf else capacity
+    cache = ResidentCache(eff_cap)
+    mode = "性能" if perf else "省メモリ"
+    print(f"  {mode}モード: 実効容量 {cache.stats()['capacity']}（明示指定）")
+    return cache
+
+
+def autotune_capacity(cache, store, model_path, auto, perf=False):
+    """常駐容量をメモリ予算から確定する（融合 expert 解放後に呼ぶこと）。
+
+    非 expert 重みは常に常駐するため、その実測分を予算から差し引く。
+    expert 総数を上限とし、全部載るモデルで無駄なスロットを持たない。
+    auto=False（容量の明示指定）のときは何もしない。
+    """
+    if not auto:
+        return
+    budget = budget_bytes_from_env()
+    per_expert = store.per_expert_bytes()
+    if budget <= 0 or per_expert <= 0:
+        print(
+            f"  容量自動設定を断念（予算={budget}B, expert={per_expert}B）: "
+            f"暫定容量 {cache.capacity} のまま"
+        )
+        return
+    non_expert = mx.get_active_memory()
+    max_experts = _count_experts(model_path)
+    headroom = DEFAULT_HEADROOM
+    if perf:
+        # 性能モードは他アプリの取り分を削って常駐率を上げる
+        headroom = min(0.9, headroom + 0.1)
+    cache.capacity = plan_cache_experts(
+        budget, non_expert, per_expert, max_experts=max_experts, headroom=headroom
+    )
+    gb = cache.capacity * per_expert / 1024**3
+    mode = "性能" if perf else "省メモリ"
+    print(
+        f"  {mode}モード: 実効容量 {cache.capacity}（{gb:.1f}GB）"
+        f" ← 予算{budget / 1024**3:.0f}GB×{headroom:.2f}"
+        f" − 非expert{non_expert / 1024**3:.1f}GB"
+        f" / expert{per_expert / 1024**2:.2f}MB"
+        + (f", 上限{max_experts}" if max_experts else "")
+    )
+
+
+def _count_experts(model_path):
+    """モデル全体の routed expert 総数（層数×expert数）。不明なら None。"""
+    if not model_path:
+        return None
+    try:
+        cfg = json.load(open(os.path.join(model_path, "config.json")))
+    except Exception:
+        return None
+    tc = cfg.get("text_config", cfg)
+    n_layers = tc.get("num_hidden_layers")
+    n_exp = tc.get("num_experts") or tc.get("n_routed_experts")
+    if not n_layers or not n_exp:
+        return None
+    return int(n_layers) * int(n_exp)
+
+
 def wire_streaming(
     model,
-    capacity,
+    capacity=None,
     top_k=None,
     perf=False,
     store_dir=None,
@@ -759,11 +837,13 @@ def wire_streaming(
 ):
     """全層の mlp を StreamingMoE に差し替え、融合expertを解放。
 
+    capacity=None（既定）でメモリ予算からの自動導出。数値を渡すと明示上書き。
     top_k=None の場合、config.json の num_experts_per_tok を自動検出。
-    perf=True の場合、実効容量を 8000（≈13.5GB）に引き上げ。
+    perf=True の場合、常駐率を上げる（明示容量時は最低 8000 に引き上げ）。
     store_dir/model_path 未指定時はモジュール既定（resolve_model()の結果）を使う。
     model_type が "deepseek_v4" の場合は V4 専用パスを使用。
     """
+    _auto_cap = capacity is None
     if model_type is None and model_path is not None:
         try:
             cfg = json.load(open(os.path.join(model_path, "config.json")))
@@ -821,19 +901,7 @@ def wire_streaming(
         print(
             f"  GlobalSlotCache: {gsc_ne}slots x {len(init_layers)}layers (~{gsc_ne * pe / 1024:.1f}GB)"
         )
-    if perf:
-        eff_cap = max(capacity, 8000)
-        cache = ResidentCache(eff_cap)
-        s = cache.stats()
-        print(
-            f"  性能モード: 実効容量 {s['capacity']}（{s['capacity'] * 1.69 / 1000:.1f}GB）"
-        )
-    else:
-        cache = ResidentCache(capacity)
-        s = cache.stats()
-        print(
-            f"  省メモリモード: 実効容量 {s['capacity']}（{s['capacity'] * 1.69 / 1000:.1f}GB）"
-        )
+    cache = _make_cache(capacity, perf)
     # プレフィル高速化: 元モデルの融合テンソルを mmap 直読みする（読めなければ従来経路）
     fused_store = None
     try:
@@ -908,6 +976,8 @@ def wire_streaming(
     if n_dense:
         print(f"  dense層{n_dense}個はストリーミング対象外のまま常駐（通常のMLP）")
     mx.clear_cache()
+    # 融合 expert を解放した今の使用量＝非 expert 重みの実測値。これを差し引いて確定する。
+    autotune_capacity(cache, store, model_path or MODEL_PATH, _auto_cap, perf)
 
     # 起動時ウォームスタート: 前回セッション終了時の常駐セットを SSD から先読みし、
     # コールドスタート直後の命中率を前回定常値から開始する。
@@ -961,19 +1031,7 @@ def _wire_deepseek_v4(
     activation = "sqrtsoftplus"
     routing_scale = 1.5
     store = ExpertStore(store_dir or STORE_DIR)
-    if perf:
-        eff_cap = max(capacity, 8000)
-        cache = ResidentCache(eff_cap)
-        s = cache.stats()
-        print(
-            f"  性能モード: 実効容量 {s['capacity']}（{s['capacity'] * 1.69 / 1000:.1f}GB）"
-        )
-    else:
-        cache = ResidentCache(capacity)
-        s = cache.stats()
-        print(
-            f"  省メモリモード: 実効容量 {s['capacity']}（{s['capacity'] * 1.69 / 1000:.1f}GB）"
-        )
+    cache = _make_cache(capacity, perf)
     layers = getattr(model, "layers", None)
     if layers is None:
         layers = getattr(model, "model", model).layers
@@ -997,6 +1055,7 @@ def _wire_deepseek_v4(
         layer.set_streaming_moe(moe)
         n_moe += 1
     mx.clear_cache()
+    autotune_capacity(cache, store, model_path or MODEL_PATH, capacity is None, perf)
     return cache, store
 
 

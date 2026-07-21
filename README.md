@@ -101,6 +101,39 @@ pip install mlx mlx-lm "transformers==4.57.6" huggingface_hub hf_transfer
 
 
 
+### 常駐キャッシュ容量（ElfMoon128 の変更点）
+
+ElfMoon4 は常駐 expert 数を固定値 6144 としていたが、ElfMoon128 では **メモリ予算から自動導出** する。
+200B〜700B 級ではモデルごとに 1 expert のバイト数が大きく変わるため、スロット数固定では実メモリ使用量が破綻するため。
+
+```
+容量 = (予算 × headroom − 非expert重みの実測値) ÷ 1expertのバイト数     （上限: expert 総数）
+```
+
+- **予算**: `ELFMOON_MEM_BUDGET_GB` があればその値、無ければ物理 RAM（`sysctl hw.memsize`）を自動検出
+- **headroom**: 既定 0.75（`--perf` 時 0.85）。KV キャッシュ・活性化・他アプリの取り分を残す
+- **非 expert 重み**: 融合 expert 解放後の `mx.get_active_memory()` の実測値。常に常駐するため必ず差し引く
+- **上限**: `num_hidden_layers × num_experts`。全部載るモデルで無駄なスロットを確保しない
+
+```bash
+# 自動（既定）
+python3 elfmoon/chat.py --model qwen3.6-35b-mlx
+
+# 予算を明示（他アプリに RAM を残したいとき）
+ELFMOON_MEM_BUDGET_GB=96 python3 elfmoon/chat.py --model qwen3.6-35b-mlx
+
+# 常駐 expert 数を直接指定（従来どおりの明示上書き）
+python3 elfmoon/chat.py 6144 --model qwen3.6-35b-mlx
+```
+
+起動時に導出の内訳が表示される:
+
+```
+  省メモリモード: 実効容量 38912（76.0GB） ← 予算128GB×0.75 − 非expert20.0GB / expert2.00MB
+```
+
+> 検証状況: ロジックは [`test_capacity_plan.py`](elfmoon/test_capacity_plan.py) で単体検証済み。実モデルでの動作確認は未実施。
+
 ### ストリーミング MoE モデル（大規模 MoE）
 
 `integrate.py split_all` で expert 分解が必要（`store/` ディレクトリを生成）。

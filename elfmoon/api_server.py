@@ -10,7 +10,7 @@ OpenAI 互換 API をサポートする全ツールから ElfMoon を使える�
     python3 api_server.py [port] [resident_capacity] [--model NAME] [--no-think]
     python3 api_server.py --list                      # 利用可能なモデル一覧
 
-    デフォルト: port=11434, capacity=6144, バインド先=127.0.0.1, model=ELFMOON_MODEL(既定qwen3.6-35b-mlx)
+    デフォルト: port=11434, capacity=auto(メモリ予算から導出), バインド先=127.0.0.1, model=ELFMOON_MODEL(既定qwen3.6-35b-mlx)
     （LAN に公開する場合のみ ELFMOON_HOST=0.0.0.0 を指定。認証は無いので注意）
     モデル置き場は ELFMOON_MODELS_ROOT で指定（既定 ../models）。各モデルは
     <ELFMOON_MODELS_ROOT>/<name>/ に元重み一式 + integrate.py が作る store/ を持つ。
@@ -58,7 +58,7 @@ from stream_model import MODELS_ROOT, list_models, resolve_model, wire_streaming
 
 HOST = os.environ.get("ELFMOON_HOST", "127.0.0.1")
 DEFAULT_PORT = 11434
-DEFAULT_CAPACITY = 6144
+DEFAULT_CAPACITY = None  # None=メモリ予算から自動導出
 MODEL_ID = "elfmoon"
 MAX_TOKENS = 16384
 TEMP = 0.6
@@ -371,7 +371,7 @@ def _extract_tool_calls(text: str) -> tuple[str, list[dict]]:
 class GenerationEngine:
     """モデルを専用スレッドで保持し、リクエストを直列化して generation する。"""
 
-    def __init__(self, model_path: str, store_dir: str, cap: int, perf: bool):
+    def __init__(self, model_path: str, store_dir: str, cap: int | None, perf: bool):
         self._queue = Queue()
         self._ready = ThreadEvent()
         self._thread = Thread(target=self._run, daemon=True)
@@ -1384,7 +1384,7 @@ def main():
 
     mode = "性能" if perf else "省メモリ"
     print(f"モデル: {model_path}", flush=True)
-    print(f"モデルをロード中...（{mode}モード, capacity={cap}）", flush=True)
+    print(f"モデルをロード中...（{mode}モード, capacity={cap or 'auto'}）", flush=True)
     t0 = time.perf_counter()
 
     engine = GenerationEngine(model_path, store_dir, cap, perf)

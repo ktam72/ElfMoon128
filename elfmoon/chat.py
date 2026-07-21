@@ -5,7 +5,7 @@
 
 使い方:
     cd elfmoon
-    python3 chat.py                       # 常駐 6144 (既定モデル)
+    python3 chat.py                       # 常駐容量はメモリ予算から自動 (既定モデル)
     python3 chat.py --model 80b           # ELFMOON_MODELS_ROOT/80b を使用
     python3 chat.py --model 80b 1200      # モデル指定 + 省メモリ
     python3 chat.py --no-think            # 思考プロセスを非表示
@@ -132,7 +132,7 @@ def main():
         model_name = argv[idx + 1].strip().replace("\u3000", "")
         argv = argv[:idx] + argv[idx + 2 :]
     cap_strs = [a for a in argv if a not in ("--no-think", "--perf", "--fast")]
-    cap = int(cap_strs[0]) if cap_strs else 6144
+    cap = int(cap_strs[0]) if cap_strs else None  # None=メモリ予算から自動導出
 
     model_path, store_dir = resolve_model(model_name)
     if KVC:
@@ -171,7 +171,7 @@ def main():
 
     mode = "性能" if perf else "省メモリ"
     print(f"モデル: {model_path}（type={_model_type}）")
-    print(f"モデルをロード中...（{mode}モード, capacity={cap}）")
+    print(f"モデルをロード中...（{mode}モード, capacity={cap or 'auto'}）")
     t0 = time.perf_counter()
 
     if _model_type == "deepseek_v4":

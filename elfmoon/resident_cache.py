@@ -5,7 +5,37 @@ DS4 の ds4_ssd_auto_cache_plan（予算×4/5、非routed差引、expert数算�
 命中率がElfMoonの速度を決める中核指標なので hit/miss を記録する。
 """
 
+import os
+import subprocess
 from collections import OrderedDict
+
+# 予算に対する常駐率。KV キャッシュ・活性化・他アプリの取り分を残す。
+# 200B+ MoE では KV が数 GB 規模になるため DS4 の 0.8 より保守的に取る。
+DEFAULT_HEADROOM = 0.75
+
+
+def detect_ram_bytes():
+    """物理 RAM のバイト数。取得できなければ 0。"""
+    try:
+        out = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=5
+        )
+        if out.returncode == 0:
+            return int(out.stdout.strip())
+    except Exception:
+        pass
+    return 0
+
+
+def budget_bytes_from_env():
+    """常駐予算のバイト数。ELFMOON_MEM_BUDGET_GB 優先、無ければ物理 RAM。"""
+    env = os.environ.get("ELFMOON_MEM_BUDGET_GB")
+    if env:
+        try:
+            return int(float(env) * 1024**3)
+        except ValueError:
+            print(f"  ELFMOON_MEM_BUDGET_GB={env!r} は数値でない: 無視")
+    return detect_ram_bytes()
 
 
 def plan_cache_experts(budget_bytes, non_expert_bytes, per_expert_bytes, max_experts=None, headroom=0.8):
