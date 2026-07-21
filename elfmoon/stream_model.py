@@ -23,7 +23,13 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MODEL_NAME = "qwen3.6-35b-mlx"
 
 # モデル置き場のルート。任意ディレクトリ（外部SSD等）を指せる唯一の結合点。
-MODELS_ROOT = os.environ.get("ELFMOON_MODELS_ROOT", os.path.join(_HERE, "..", "models"))
+# ElfMoon128 は ELFMOON_MODELS_ROOT128 を優先し、ElfMoon4 と置き場を分離できる
+# （両者は同じモデル名でも量子化やサイズが異なるため、混ぜると事故る）。
+MODELS_ROOT = (
+    os.environ.get("ELFMOON_MODELS_ROOT128")
+    or os.environ.get("ELFMOON_MODELS_ROOT")
+    or os.path.join(_HERE, "..", "models")
+)
 
 # gather_qmm 高速プレフィルを使う最小チャンクトークン数。これ未満は per-expert 経路
 # （ResidentCache が効き短チャンクで有利）。実測: 2048 で互角、4096 で fused 3.4倍。
