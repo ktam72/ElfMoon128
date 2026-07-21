@@ -110,7 +110,9 @@ ElfMoon4 は常駐 expert 数を固定値 6144 としていたが、ElfMoon128 �
 容量 = (予算 × headroom − 非expert重みの実測値) ÷ 1expertのバイト数     （上限: expert 総数）
 ```
 
-- **予算**: `ELFMOON_MEM_BUDGET_GB` があればその値、無ければ物理 RAM（`sysctl hw.memsize`）を自動検出
+- **予算**: `ELFMOON_MEM_BUDGET_GB` があればその値。無ければ **物理 RAM と GPU ワーキングセット上限の小さい方**。
+  128GB 機でも `max_recommended_working_set_size` は 115GB 程度（M5 Max 実測）で物理 RAM より小さく、
+  超過すると算術が正しくても確保に失敗するため頭打ちにする
 - **headroom**: 既定 0.75（`--perf` 時 0.85）。KV キャッシュ・活性化・他アプリの取り分を残す
 - **非 expert 重み**: 融合 expert 解放後の `mx.get_active_memory()` の実測値。常に常駐するため必ず差し引く
 - **上限**: `num_hidden_layers × num_experts`。全部載るモデルで無駄なスロットを確保しない
