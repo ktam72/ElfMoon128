@@ -27,18 +27,43 @@ def detect_ram_bytes():
     return 0
 
 
+def detect_working_set_bytes():
+    """GPU の推奨ワーキングセット上限。取得できなければ 0。
+
+    Apple Silicon では MLX バッファがこの上限に対して計上される。128GB 機でも
+    上限は 115GB 程度と物理 RAM より小さいため、予算はこちらで頭打ちにする。
+    """
+    try:
+        import mlx.core as mx
+
+        info = mx.device_info()
+        return int(info.get("max_recommended_working_set_size", 0))
+    except Exception:
+        return 0
+
+
 def budget_bytes_from_env():
-    """常駐予算のバイト数。ELFMOON_MEM_BUDGET_GB 優先、無ければ物理 RAM。"""
+    """常駐予算のバイト数。
+
+    ELFMOON_MEM_BUDGET_GB があればその値。無ければ物理 RAM と GPU ワーキング
+    セット上限の小さい方（上限超過は算術が正しくても確保に失敗するため）。
+    """
     env = os.environ.get("ELFMOON_MEM_BUDGET_GB")
     if env:
         try:
             return int(float(env) * 1024**3)
         except ValueError:
             print(f"  ELFMOON_MEM_BUDGET_GB={env!r} は数値でない: 無視")
-    return detect_ram_bytes()
+    ram = detect_ram_bytes()
+    ws = detect_working_set_bytes()
+    if ram and ws:
+        return min(ram, ws)
+    return ram or ws
 
 
-def plan_cache_experts(budget_bytes, non_expert_bytes, per_expert_bytes, max_experts=None, headroom=0.8):
+def plan_cache_experts(
+    budget_bytes, non_expert_bytes, per_expert_bytes, max_experts=None, headroom=0.8
+):
     """常駐予算からホットexpert数を算出（DS4方式）。"""
     target = int(budget_bytes * headroom)
     cache_bytes = max(0, target - non_expert_bytes)

@@ -11,6 +11,7 @@ from resident_cache import (
     ResidentCache,
     budget_bytes_from_env,
     detect_ram_bytes,
+    detect_working_set_bytes,
     plan_cache_experts,
 )
 
@@ -27,13 +28,16 @@ class _FakeStore:
 
 
 class _FakeMx:
-    """mx.get_active_memory() だけを差し替えるスタブ。"""
+    """mx.get_active_memory() / mx.eval() を差し替えるスタブ。"""
 
     def __init__(self, active):
         self._active = active
 
     def get_active_memory(self):
         return self._active
+
+    def eval(self, *a, **kw):
+        pass
 
 
 def _autotune(cache, store, active_bytes, model_path=None, perf=False, auto=True):
@@ -57,9 +61,11 @@ def test_budget_env_override():
     try:
         os.environ["ELFMOON_MEM_BUDGET_GB"] = "128"
         assert budget_bytes_from_env() == 128 * GB
-        # 数値でない値は無視して物理 RAM にフォールバック
+        # 数値でない値は無視して自動検出（物理 RAM とワーキングセット上限の小さい方）
         os.environ["ELFMOON_MEM_BUDGET_GB"] = "abc"
-        assert budget_bytes_from_env() == detect_ram_bytes()
+        assert budget_bytes_from_env() == min(
+            detect_ram_bytes(), detect_working_set_bytes()
+        )
     finally:
         if old is None:
             os.environ.pop("ELFMOON_MEM_BUDGET_GB", None)
@@ -112,6 +118,28 @@ def test_autotune_gives_up_without_store():
     cache = ResidentCache(sm._PROVISIONAL_CAPACITY)
     _autotune(cache, _FakeStore(0), active_bytes=20 * GB)
     assert cache.capacity == sm._PROVISIONAL_CAPACITY
+
+
+def test_autotune_rejects_implausible_non_expert():
+    """非 expert の実測値が過小（＝遅延評価で未実体化）なら容量を確定しない。
+
+    ここで 0 付近を信じると予算を丸ごと expert に配って OOM するため、
+    暫定容量のまま続行する方が安全。
+    """
+    os.environ["ELFMOON_MEM_BUDGET_GB"] = "128"
+    try:
+        cache = ResidentCache(sm._PROVISIONAL_CAPACITY)
+        _autotune(cache, _FakeStore(2 * MB), active_bytes=1 * MB)
+        assert cache.capacity == sm._PROVISIONAL_CAPACITY
+    finally:
+        os.environ.pop("ELFMOON_MEM_BUDGET_GB", None)
+
+
+def test_budget_capped_by_working_set():
+    """予算が GPU ワーキングセット上限を超えない（超えると確保に失敗する）。"""
+    ws = detect_working_set_bytes()
+    assert ws > 0, "Apple Silicon ではワーキングセット上限が取得できるはず"
+    assert budget_bytes_from_env() <= ws
 
 
 def test_perf_mode_is_larger():

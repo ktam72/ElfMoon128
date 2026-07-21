@@ -756,6 +756,10 @@ def _read_routing_config(model_path=None):
 #: 予算導出まで使う暫定容量。実容量は autotune_capacity() で確定する。
 _PROVISIONAL_CAPACITY = 4096
 
+#: 非 expert 重みの実測値がこれを下回ったら測定失敗とみなす。
+#: 対象クラス（35B〜700B MoE）の attention/embedding だけでも必ず超える下限。
+_MIN_PLAUSIBLE_NON_EXPERT = 1024**3
+
 
 def _make_cache(capacity, perf):
     """常駐キャッシュを生成する。
@@ -773,7 +777,22 @@ def _make_cache(capacity, perf):
     return cache
 
 
-def autotune_capacity(cache, store, model_path, auto, perf=False):
+def _measure_non_expert_bytes(model):
+    """常駐する非 expert 重みのバイト数を実測する。
+
+    MLX は遅延評価のため、未実体化のまま測ると 0 に近い値が返り、予算を丸ごと
+    expert に配ってしまう（＝初回推論で OOM）。測る前に必ず実体化する。
+    """
+    try:
+        params = model.parameters() if hasattr(model, "parameters") else None
+        if params is not None:
+            mx.eval(params)
+    except Exception as e:
+        print(f"  非expert重みの実体化に失敗（測定値が過小の可能性）: {e}")
+    return mx.get_active_memory()
+
+
+def autotune_capacity(cache, store, model_path, auto, perf=False, model=None):
     """常駐容量をメモリ予算から確定する（融合 expert 解放後に呼ぶこと）。
 
     非 expert 重みは常に常駐するため、その実測分を予算から差し引く。
@@ -790,7 +809,19 @@ def autotune_capacity(cache, store, model_path, auto, perf=False):
             f"暫定容量 {cache.capacity} のまま"
         )
         return
-    non_expert = mx.get_active_memory()
+    non_expert = (
+        _measure_non_expert_bytes(model)
+        if model is not None
+        else mx.get_active_memory()
+    )
+    # 非 expert 重みが極端に小さい＝測定失敗とみなす。ここで誤って 0 付近を信じると
+    # 予算を丸ごと expert に配って OOM するため、暫定容量のまま続行する方が安全。
+    if non_expert < _MIN_PLAUSIBLE_NON_EXPERT:
+        print(
+            f"  非expert重みの実測値が過小（{non_expert / 1024**2:.0f}MB）: "
+            f"測定失敗とみなし暫定容量 {cache.capacity} のまま続行"
+        )
+        return
     max_experts = _count_experts(model_path)
     headroom = DEFAULT_HEADROOM
     if perf:
@@ -977,7 +1008,7 @@ def wire_streaming(
         print(f"  dense層{n_dense}個はストリーミング対象外のまま常駐（通常のMLP）")
     mx.clear_cache()
     # 融合 expert を解放した今の使用量＝非 expert 重みの実測値。これを差し引いて確定する。
-    autotune_capacity(cache, store, model_path or MODEL_PATH, _auto_cap, perf)
+    autotune_capacity(cache, store, model_path or MODEL_PATH, _auto_cap, perf, model)
 
     # 起動時ウォームスタート: 前回セッション終了時の常駐セットを SSD から先読みし、
     # コールドスタート直後の命中率を前回定常値から開始する。
@@ -1055,7 +1086,9 @@ def _wire_deepseek_v4(
         layer.set_streaming_moe(moe)
         n_moe += 1
     mx.clear_cache()
-    autotune_capacity(cache, store, model_path or MODEL_PATH, capacity is None, perf)
+    autotune_capacity(
+        cache, store, model_path or MODEL_PATH, capacity is None, perf, model
+    )
     return cache, store
 
 
