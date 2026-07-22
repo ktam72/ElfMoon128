@@ -483,7 +483,8 @@ class StreamingMoE(nn.Module):
         xf = x.reshape(-1, shp[-1])
         logits = self.gate(xf)
         if self.activation == "sigmoid":
-            probs = mx.sigmoid(logits)
+            # glm4_moe 参照実装に合わせ float32 で sigmoid（精度パリティ確保）
+            probs = mx.sigmoid(logits.astype(mx.float32))
         elif self.activation == "sqrtsoftplus":
             probs = mx.sqrt(mx.log1p(mx.exp(-mx.abs(logits))) + mx.maximum(logits, 0))
         else:
@@ -863,6 +864,46 @@ def _count_experts(model_path):
     return int(n_layers) * int(n_exp)
 
 
+class _RawLogitsGate:
+    """複合ルーターの重みだけを使って生 logits (x @ W.T) を返すアダプタ。
+
+    mlx_lm の glm4_moe.MoEGate 等は __call__ で sigmoid+補正+グループ選択まで
+    行い (idx, weights) のタプルを返す。ElfMoon の StreamingMoE は生 logits を
+    前提とするため、重み行列だけを取り出して線形射影を再現する。
+    """
+
+    def __init__(self, weight):
+        self._w = weight
+
+    def __call__(self, x):
+        return x @ self._w.T
+
+
+def _adapt_compound_gate(gate):
+    """複合ルーター（glm4_moe 系）なら配線を補正した設定を返す。
+
+    戻り値: (gate_obj, activation, correction_bias, routing_scale, norm) または
+    通常の Linear gate なら None（呼び出し側は既存の検出値を使う）。
+    n_group>1 のグループ選択は ElfMoon の経路に無いため未対応として弾く。
+    """
+    # 平易な Linear gate（Qwen 系）は e_score_correction_bias を持たない
+    if not (hasattr(gate, "e_score_correction_bias") and hasattr(gate, "weight")):
+        return None
+    n_group = getattr(gate, "n_group", 1) or 1
+    if n_group > 1:
+        raise NotImplementedError(
+            f"n_group={n_group} のグループルーティングは未対応"
+            "（DeepSeek-V3.2/Kimi-K2 等。GLM-4.7 の n_group=1 のみ対応）"
+        )
+    return (
+        _RawLogitsGate(gate.weight),
+        "sigmoid",  # glm4_moe は config が None でも実装上 sigmoid
+        gate.e_score_correction_bias,
+        float(getattr(gate, "routed_scaling_factor", 1.0) or 1.0),
+        bool(getattr(gate, "norm_topk_prob", True)),
+    )
+
+
 def wire_streaming(
     model,
     capacity=None,
@@ -988,6 +1029,11 @@ def wire_streaming(
             )
             shared_gate = getattr(mlp, "shared_expert_gate", None)
             correction_bias = getattr(mlp, "e_score_correction_bias", None)
+            # glm4_moe 等の複合ルーターは生 logits を返さないため配線を補正する
+            _act, _norm = activation, True
+            _adapted = _adapt_compound_gate(gate)
+            if _adapted is not None:
+                gate, _act, correction_bias, routing_scale, _norm = _adapted
             layer.mlp = StreamingMoE(
                 l,
                 gate,
@@ -997,9 +1043,10 @@ def wire_streaming(
                 cache,
                 shared_exp=shared_exp,
                 shared_gate=shared_gate,
-                activation=activation,
+                activation=_act,
                 correction_bias=correction_bias,
                 routing_scale=routing_scale,
+                norm=_norm,
                 fused_store=fused_store,
                 gsc=gsc,
             )
