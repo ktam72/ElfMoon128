@@ -28,14 +28,50 @@ ElfMoon は全 expert を GPU に載せるのではなく、アクティブな e
 
 | 項目 | 要件 |
 |---|---|
-| ハードウェア | Apple Silicon Mac、**RAM 128GB 推奨**（M3/M4 Max・Ultra クラス） |
+| ハードウェア | Apple Silicon Mac、**RAM 128GB 推奨**（M3/M4/M5 Max・Ultra クラス）。検証機は M5 Max 128GB |
 | OS | macOS 14 以降 （26.5以降推奨）|
 | Python | 3.10 以降 |
-| ディスク空き | 35B: ~47GB / 80B・Coder-Next: ~84GB（元モデル + 分解済 expert、`ELFMOON_MODELS_ROOT` 配下） |
+| ディスク空き | 元モデル + 分解済 expert でモデルサイズの約2倍。Qwen3-235B(123GB): ~246GB / GLM-4.7(185GB): ~370GB。高速化のため store は内蔵 SSD 推奨 |
+| モデル置き場 | `ELFMOON_MODELS_ROOT128`（未設定時 `ELFMOON_MODELS_ROOT`）配下 |
 | 依存 | MLX / mlx-lm / **transformers==4.57.6**（5.x は非互換） |
 
 ---
-## 動作確認済みモデル
+## 動作確認済みモデル（ElfMoon128, M5 Max 128GB 実測）
+
+128GB オンメモリでは載り切らない（GPU ワーキングセット上限 108GiB を超える）巨大 MoE を、
+ストリーミングで実用速度動作させたもの。計測は下記「推奨高速化設定」下での定常値（warm）。
+
+| モデル | サイズ | 常駐率 | デコード t/s | 備考 |
+|---|---|---|---|---|
+| **[Qwen3-235B-A22B-Instruct-2507](https://huggingface.co/mlx-community/Qwen3-235B-A22B-Instruct-2507-4bit)**（最推奨） | 123 GB | 82% | **11.0** | qwen3_moe ネイティブ。命中率100%到達。品質・速度の最良バランス |
+| **[GLM-4.7](https://huggingface.co/mlx-community/GLM-4.7-4bit)** | 185 GB | 54% | **6.7** | glm4_moe。命中率93%。複合ルーター対応済み（n_group=1） |
+
+> 未検証だが同経路で動作見込み: Qwen3-235B-A22B-Thinking / Qwen3-Coder-480B-A35B（252GB）/ GLM-4.6（185GB）。
+> n_group>1（DeepSeek-V3.2 / Kimi-K2 / Ring-1T 等）は現状のグループルーティング未対応。
+> 128GB 超 MoE の候補一覧は `evidence/elfmoon128/moe-candidates-over-128gb.md` を参照。
+
+### 推奨高速化設定（M5 Max 128GB での実測ベース）
+
+decode は expert ストリーミングの I/O 律速のため、命中率と I/O 帯域が速度を決める。
+
+```bash
+# 1) GPU ワーキングセット上限を引き上げ（要 sudo・再起動でリセット）
+sudo sysctl iogpu.wired_limit_mb=122880          # 120GB
+
+# 2) store（分解済 expert）を内蔵 SSD に置く（外付けより随時読みが ~2倍速い）
+ELFMOON_STORE_DIR=/path/to/internal/store \
+ELFMOON_MODEL_DIR=/path/to/model \
+ELFMOON_MEM_BUDGET_GB=120 \                       # 上限120GBを予算に反映
+ELFMOON_TOP_K=6 \                                 # ルーティング top_k 削減（8→6, 品質微減）
+  python3 elfmoon/chat.py --no-think --perf
+```
+
+GLM-4.7 では上記の組み合わせで 2.3→6.7 tok/s（約3倍、命中率88→95%）を確認。
+Qwen3-235B は expert が小型・高常駐率のため命中率100%に達し、追加調整なしで 11 tok/s。
+
+## 動作確認済みモデル（ElfMoon4 から継承・M4 Pro 24GB 実測 / ElfMoon128 では未再計測）
+
+以下は ElfMoon4 のオンメモリ／小規模ストリーミング MoE 実績（24GB 機）。ElfMoon128 での再計測は未実施。
 
 | モデル | タイプ | ファイルサイズ | デコード t/s | 備考 |
 |---|---|---|---|---|
@@ -54,7 +90,7 @@ ElfMoon は全 expert を GPU に載せるのではなく、アクティブな e
 | **[Qwen3-Coder-Next](https://huggingface.co/mlx-community/Qwen3-Coder-Next-4bit)** | ストリーミング MoE | 42 GB | **22** | コード特化 |
 | **[Qwen3.6-27B](https://huggingface.co/mlx-community/Qwen3.6-27B-4bit)** | オンメモリ | 15 GB | **15** | dense 27B |
 | **[Qwen3.5-REAP-97B](https://huggingface.co/mlx-community/Qwen3.5-REAP-97B-A10B-4bit)**（非推奨） | ストリーミング MoE | 51 GB | **13-14** | cap=2048で14GB/14t/s, cap=1024で9GB/13t/s |
-| **[DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-DSpark)** | — | — | — | 24GB では未対応 |
+| **[DeepSeek-V4-Flash](https://huggingface.co/mlx-community/DeepSeek-V4-Flash-4bit)** | model_v4 独立経路 | 141 GB | — | ElfMoon128 で 128GB 級として要検証。`model_v4.py` の memmap 経路（低速見込み・ResidentCache 非経由） |
 
 ---
 
