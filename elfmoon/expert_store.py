@@ -38,9 +38,21 @@ class ExpertStore:
         return os.path.join(self.path, f"l{layer}_e{expert}.safetensors")
 
     def per_expert_bytes(self):
-        """1 expert の概算バイト数（キャッシュ予算計算用）。"""
+        """1 expert の概算バイト数（キャッシュ予算計算用）。
+
+        layer0 は first_k_dense_replace 等で dense（expert 無し）のモデルが
+        あるため l0_e0 固定で見ない。最初に見つかった expert ファイルを使う。
+        """
         f = self._file(0, 0)
-        return os.path.getsize(f) if os.path.exists(f) else 0
+        if os.path.exists(f):
+            return os.path.getsize(f)
+        try:
+            for name in os.listdir(self.path):
+                if name.startswith("l") and "_e" in name and name.endswith(".safetensors"):
+                    return os.path.getsize(os.path.join(self.path, name))
+        except OSError:
+            pass
+        return 0
 
     def load(self, layer, expert):
         """1 expert の重みを dict で返す（mx.array 群）。"""
