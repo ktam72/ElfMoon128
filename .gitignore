@@ -31,7 +31,7 @@ elfmoon/bench/
 elfmoon/hyper_connection.py
 elfmoon/integrate_v4.py
 elfmoon/mla_attention.py
-elfmoon/model_v4.py
+# elfmoon/model_v4.py  ← DeepSeek-V4 推論本体（chat.py/api_server.py が import）。追跡対象に含める
 elfmoon/norm_rope_v4.py
 elfmoon/sparse_attention.py
 elfmoon/vision_encoder.py
