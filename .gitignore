@@ -8,7 +8,7 @@ ref-ds4/
 
 # 設計ドキュメント・変更記録（コミット対象外）
 evidence/
-docs/
+# docs/  ← 設計ドキュメントは追跡対象に含める
 
 # ログ・一時ファイル
 *.log
@@ -25,7 +25,7 @@ __pycache__/
 .DS_Store
 
 # ベンチマーク（開発者向け、第三者は不要）
-elfmoon/bench/
+# elfmoon/bench/  ← ベンチマークスクリプトは追跡対象に含める
 
 # 実験的実装（DeepSeek V4 Flash / VL 等。第三者は不要）
 elfmoon/hyper_connection.py
