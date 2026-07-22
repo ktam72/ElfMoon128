@@ -6,6 +6,8 @@
 
 基本アーキテクチャ（デュアルモード推論、ストリーミング MoE、`store/` 分解、OpenAI 互換 API / 対話 CLI）は ElfMoon4 と共通。**本 README は ElfMoon128 固有の差分のみを記載し、共通事項は [ElfMoon4 の README](../ElfMoon4/README.md) を参照する。**
 
+>⚠️ ElfMoon4 で構築したモデルディレクトリ（元モデル + 分解済み `store/`）は ElfMoon128 でそのまま動作可能（store 形式は完全互換・上位互換）
+
 ---
 
 ## ElfMoon128 の主な変更点（vs ElfMoon4）
