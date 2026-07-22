@@ -44,7 +44,7 @@
 | **[GLM-4.7](https://huggingface.co/mlx-community/GLM-4.7-4bit)** | 185 GB | 54% | **6.7** | glm4_moe。命中率93%。複合ルーター対応済み（n_group=1） |
 
 > - 未検証だが同経路で動作見込み: Qwen3-235B-A22B-Thinking / Qwen3-Coder-480B-A35B（252GB）/ GLM-4.6（185GB）。
-> - n_group>1（DeepSeek-V3.2 / Kimi-K2 / Ring-1T 等）は現状のグループルーティング未対応。
+> - n_group>1（Kimi-K2 / Ring-1T 等）は現状のグループルーティング未対応。
 > - 128GB 超 MoE の候補一覧は [`evidence/elfmoon128/moe-candidates-over-128gb.md`](evidence/elfmoon128/moe-candidates-over-128gb.md) を参照。
 
 ### 参考: 108GiB 内でオンメモリ動作するモデル
