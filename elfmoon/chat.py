@@ -330,6 +330,9 @@ def main():
                     prefill_step_size=PREFILL_STEP,
                 )
                 _kvc_save_ids, _kvc_snap = None, None
+                _prefill_n = 0
+                _prefill_t0 = None
+                _prefill_t1_ref = [None]  # KV Manager/従来経路の prefill 終了時刻
                 if KVC:
                     # 会話履歴部分の KV を再利用し、毎ターンの全履歴再プレフィルを回避する。
                     # 失敗時は従来経路にフォールバック（会話は止めない）。
@@ -355,6 +358,8 @@ def main():
                         else:
                             prompt_cache = make_prompt_cache(model)
                             cached_len = 0
+                        _prefill_n = len(prompt_ids) - cached_len
+                        _prefill_t0 = time.perf_counter()
                         if cached_len < boundary:
                             remaining = prompt_ids[cached_len:boundary]
                             for ci in range(0, len(remaining), PREFILL_STEP):
@@ -375,6 +380,13 @@ def main():
                         )
                     except Exception:
                         pass  # 従来経路（全プレフィル）で続行
+                if _prefill_n == 0:
+                    # 従来経路: stream_generate 内で全プレフィル
+                    prompt_ids = (
+                        tok.encode(prompt) if isinstance(prompt, str) else prompt
+                    )
+                    _prefill_n = len(prompt_ids) if isinstance(prompt_ids, list) else 0
+                    _prefill_t0 = time.perf_counter()
                 generator = stream_generate(**_gen_kwargs)
 
                 # Thinking専用モデル: template がプロンプト側に <think> を置き
@@ -392,6 +404,8 @@ def main():
                     for out in generator:
                         if _first_raw_t[0] == 0.0:
                             _first_raw_t[0] = time.perf_counter()
+                            if _prefill_t1_ref[0] is None:
+                                _prefill_t1_ref[0] = _first_raw_t[0]
                         yield out.text
 
                 if _in_think:
@@ -430,10 +444,23 @@ def main():
         elapsed = (
             (time.perf_counter() - answer_t) if answer_t else (time.perf_counter() - t)
         )
+        _pf_elapsed = (
+            _prefill_t1_ref[0] - _prefill_t0
+            if (
+                _prefill_t0 is not None
+                and _prefill_t1_ref[0] is not None
+                and _prefill_t1_ref[0] > _prefill_t0
+            )
+            else None
+        )
+        pf_info = ""
+        if _pf_elapsed is not None and _pf_elapsed > 0:
+            pf_speed = _prefill_n / _pf_elapsed
+            pf_info = f"プリフィル {_prefill_n}tok {pf_speed:.0f}tok/s ／ "
         hit = f", 命中率{cache.hit_rate * 100:.0f}%" if cache else ""
         think_info = f"思考 {think_s:.1f}s ／ " if think_s > 0 else ""
         print(
-            f"\n\033[2m（{think_info}{n} tokens, {n / elapsed:.1f} tok/s{hit}）\033[0m"
+            f"\n\033[2m（{think_info}{pf_info}{n} tokens, {n / elapsed:.1f} tok/s{hit}）\033[0m"
         )
         messages.append({"role": "assistant", "content": resp})
 
