@@ -634,13 +634,16 @@ class GenerationEngine:
             else:
                 pass  # mx.compile は現在の環境で遅くなるためスキップ
 
-    def _generate_legacy(self, prompt, prompt_nogen, max_tokens, temperature, no_think):
+def _generate_legacy(self, prompt, prompt_nogen, max_tokens, temperature, no_think):
         """従来の高速パス: KV Cache 永続化 + 境界スナップショット対応。"""
         tokenizer = self._tokenizer
         model = self._model
 
         prompt_ids = tokenizer.encode(prompt)
         prompt_tokens = len(prompt_ids)
+        # 動的プリフィル調整: 最終チャンクが小さくなりすぎないよう PREFILL_STEP を調整
+        from stream_model import optimal_prefill_step
+        PREFILL_STEP = optimal_prefill_step(prompt_tokens)
         yield prompt_tokens
 
         print(
@@ -776,6 +779,9 @@ class GenerationEngine:
             if not yielded_prompt_tokens:
                 yield len(prompt_ids)
                 yielded_prompt_tokens = True
+                # 動的プリフィル調整（1回目のみ）: 最終チャンクが小さくなりすぎないよう調整
+                from stream_model import optimal_prefill_step
+                PREFILL_STEP = optimal_prefill_step(len(prompt_ids))
                 print(
                     f"[ENGINE] prompt={len(prompt_ids)}tok max_tokens={max_tokens} temp={temperature} tools={bool(tools)}",
                     file=sys.stderr,

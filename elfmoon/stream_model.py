@@ -36,6 +36,44 @@ MODELS_ROOT = (
 FUSED_MIN_TOKENS = int(os.environ.get("ELFMOON_FUSED_MIN_TOKENS", "2048"))
 
 
+def set_fused_min_tokens(model, value):
+    layers = (
+        getattr(model, "layers", None)
+        or getattr(model.model, "layers", None)
+        or getattr(model.language_model, "layers", None)
+    )
+    if layers is not None:
+        n_set = 0
+        for layer in layers:
+            mlp = getattr(layer, "mlp", None)
+            if mlp is not None and hasattr(mlp, "dynamic_fused_min_tokens"):
+                mlp.dynamic_fused_min_tokens = value
+                n_set += 1
+        if n_set:
+            print(f"  dynamic_fused_min_tokens={value} ({n_set} layers)", flush=True)
+
+
+def optimal_prefill_step(prompt_len, default_step=4096, min_chunk=2048):
+    """最終チャンクが小さくなりすぎないよう PREFILL_STEP を調整する。
+
+    最終チャンクトークン数が min_chunk 未満になると per-expert フォールバック
+    経路になり大幅に低速化するため、それを回避する。
+    3チャンク以上でも正しく動作するよう、candidate の余りも検証する。
+    """
+    if prompt_len <= default_step:
+        return prompt_len
+    remainder = prompt_len % default_step
+    if remainder == 0 or remainder >= min_chunk:
+        return default_step
+    deficit = min_chunk - remainder
+    candidate = default_step - deficit
+    if candidate >= min_chunk:
+        c_rem = prompt_len % candidate
+        if c_rem == 0 or c_rem >= min_chunk:
+            return candidate
+    return default_step
+
+
 def resolve_model(name=None):
     """モデル名 → (model_path, store_dir) を解決する。
 
@@ -432,6 +470,7 @@ class StreamingMoE(nn.Module):
         self._gsc = gsc
         self._fused_store = fused_store
         self._is_last_moe = is_last_moe
+        self.dynamic_fused_min_tokens = FUSED_MIN_TOKENS
         self.norm = norm
         self.activation = activation
         self.correction_bias = correction_bias
@@ -588,7 +627,11 @@ class StreamingMoE(nn.Module):
         # （短チャンクは ResidentCache が効く per-expert 経路が有利。実測の損益分岐:
         # N=2048 でほぼ互角、N=4096 で fused が3.4倍）。読めないモデルはフォールバック。
         fs = self._fused_store
-        if fs is not None and N >= FUSED_MIN_TOKENS and self.layer_idx in fs:
+        if (
+            fs is not None
+            and N >= self.dynamic_fused_min_tokens
+            and self.layer_idx in fs
+        ):
             fused = fs.load(self.layer_idx)
             out = _prefill_moe_gather(
                 xf, idx, w, fused, self.group_size, self.bits, self.mode

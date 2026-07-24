@@ -531,6 +531,12 @@ def main():
                 n = len(new_ids)
                 resp = tok.decode(new_ids, skip_special_tokens=True)
             else:
+                # 動的プリフィル調整: 最終チャンクが小さくなりすぎないよう PREFILL_STEP を調整
+                _prompt_ids_for_tune = tok.encode(prompt)
+                _prompt_len = len(_prompt_ids_for_tune)
+                from stream_model import optimal_prefill_step
+
+                PREFILL_STEP = optimal_prefill_step(_prompt_len)
                 _sampler = make_sampler(**_sampler_kwargs)
                 _gen_kwargs = dict(
                     model=model,
