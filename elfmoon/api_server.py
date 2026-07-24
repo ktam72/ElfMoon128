@@ -51,6 +51,7 @@ import mlx.core as mx
 from kv_manager import kv_manager
 from mcp_client import mcp_manager, MCPError
 from mlx_lm import load as _mlx_load
+from mlx_lm.utils import load_model
 from mlx_lm.generate import generate_step
 from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.sample_utils import make_sampler
@@ -558,6 +559,42 @@ class GenerationEngine:
             from transformers import AutoTokenizer
 
             self._tokenizer = AutoTokenizer.from_pretrained(str(mp))
+        elif model_type == "laguna" or "laguna" in mp.name.lower():
+            from laguna_opt import Model as OptimizedLagunaModel, ModelArgs
+
+            def _get_laguna_classes(config):
+                return OptimizedLagunaModel, ModelArgs
+
+            self._model, _ = load_model(
+                mp, lazy=True, get_model_classes=_get_laguna_classes
+            )
+            mx.clear_cache()
+            self._moe_cache = None
+            # Tokenizer
+            try:
+                _tok_cfg = {
+                    "tokenizer_class": "PreTrainedTokenizerFast",
+                    "add_prefix_space": False,
+                }
+                _, self._tokenizer = _mlx_load(
+                    str(mp),
+                    tokenizer_config=_tok_cfg,
+                    lazy=True,
+                )
+            except Exception:
+                from transformers import PreTrainedTokenizerFast
+                from tokenizers import Tokenizer
+
+                tk = Tokenizer.from_file(str(mp / "tokenizer.json"))
+                self._tokenizer = PreTrainedTokenizerFast(tokenizer_object=tk)
+                ct_path = mp / "chat_template.jinja"
+                if ct_path.exists():
+                    self._tokenizer.chat_template = ct_path.read_text()
+                with open(mp / "config.json") as f:
+                    _eos_cfg = json.load(f)
+                eos_ids = _eos_cfg.get("eos_token_id", [])
+                if isinstance(eos_ids, list) and eos_ids:
+                    self._tokenizer.eos_token_id = eos_ids[0]
         else:
             from mlx_lm.utils import load_model as _lm_load
 

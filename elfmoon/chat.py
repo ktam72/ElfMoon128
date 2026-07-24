@@ -20,6 +20,8 @@ import os
 import sys
 import time
 
+import mlx.core as mx
+
 # プロジェクトルートをパスに追加（model_v4.py の elfmoon. インポート用）
 _PROJ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJ not in sys.path:
@@ -182,6 +184,38 @@ def main():
         from transformers import AutoTokenizer
 
         tok = AutoTokenizer.from_pretrained(model_path)
+    elif _model_type == "laguna" or "laguna" in os.path.basename(model_path).lower():
+        from laguna_opt import Model as OptimizedLagunaModel, ModelArgs
+
+        _mp_laguna = Path(model_path)
+
+        def _get_laguna_classes(config):
+            return OptimizedLagunaModel, ModelArgs
+
+        model, _ = load_model(
+            _mp_laguna, lazy=True, get_model_classes=_get_laguna_classes
+        )
+        mx.clear_cache()
+        cache = None
+        try:
+            _, tok = load(model_path, lazy=True)
+        except Exception:
+            from transformers import PreTrainedTokenizerFast
+            from tokenizers import Tokenizer
+
+            tk = Tokenizer.from_file(str(_mp_laguna / "tokenizer.json"))
+            tok = PreTrainedTokenizerFast(tokenizer_object=tk)
+            ct_path = _mp_laguna / "chat_template.jinja"
+            if ct_path.exists():
+                tok.chat_template = ct_path.read_text()
+            with open(_mp_laguna / "config.json") as __cfgf:
+                __cfg = json.load(__cfgf)
+            __eos_raw = __cfg.get("eos_token_id", 1)
+            __eos_ids = __eos_raw if isinstance(__eos_raw, list) else [__eos_raw]
+            tok.eos_token_id = __eos_ids[0]
+            from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+            tok = TokenizerWrapper(tok, eos_token_ids=__eos_ids)
     else:
         _mp = Path(model_path)
         model, _ = load_model(_mp, lazy=True)
@@ -216,8 +250,6 @@ def main():
             cache, _ = wire_streaming(
                 model, cap, perf=perf, store_dir=store_dir, model_path=model_path
             )
-
-    import mlx.core as mx
 
     # mx.compile: 全denseモデルを高速化（streaming MoE は store/ があるので除外）
     if _model_type != "deepseek_v4" and not os.path.isdir(
@@ -269,8 +301,6 @@ def main():
 
         try:
             if _model_type == "deepseek_v4":
-                import mlx.core as mx
-
                 ids = tok.encode(prompt)
                 ids_arr = mx.array(ids, dtype=mx.int64)
                 new_ids = []
@@ -305,7 +335,6 @@ def main():
                     # 失敗時は従来経路にフォールバック（会話は止めない）。
                     try:
                         from kv_manager import kv_manager
-                        import mlx.core as mx
 
                         prompt_ids = tok.encode(prompt)
                         nogen = tok.apply_chat_template(
@@ -372,7 +401,9 @@ def main():
                         answer_t = time.perf_counter()
                         if _in_think:
                             # 思考中表示を消して回答を書き始める
-                            print("\r\033[K\033[1;32mElfMoon>\033[0m ", end="", flush=True)
+                            print(
+                                "\r\033[K\033[1;32mElfMoon>\033[0m ", end="", flush=True
+                            )
                         piece = piece.lstrip("\n")  # 回答冒頭の空行を除去
                         if not piece:
                             answer_t = 0.0  # 空白のみなら次piece を冒頭扱い
