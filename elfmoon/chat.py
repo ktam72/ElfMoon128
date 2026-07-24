@@ -16,9 +16,13 @@
 """
 
 import logging
+import fcntl
 import os
+import select
 import sys
+import termios
 import time
+import tty
 
 import mlx.core as mx
 
@@ -49,6 +53,211 @@ PREFILL_STEP = int(os.environ.get("ELFMOON_PREFILL_STEP", "4096"))
 KVC = os.environ.get("ELFMOON_KVC", "1") != "0"
 # 対話 CLI では KVC の情報ログがプロンプト表示に割り込むため既定で抑制（エラーは出る）
 os.environ.setdefault("ELFMOON_KVC_LOG", "0")
+
+
+def _read_utf8_char(fd):
+    b0 = os.read(fd, 1)
+    if not b0:
+        return None
+    c0 = b0[0]
+    if c0 < 0x80:
+        return chr(c0)
+    if c0 < 0xC0:
+        return "\ufffd"
+    need = 2 if c0 < 0xE0 else 3 if c0 < 0xF0 else 4
+    raw = b0
+    for _ in range(need - 1):
+        more = os.read(fd, 1)
+        if not more:
+            break
+        raw += more
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return "\ufffd"
+
+
+def _read_esc_seq(fd):
+    """Read escape sequence after ESC (consumed). Returns bytes after ESC.
+    CSI: ESC [ <params> <final> → returns b'[<params><final>'
+    SS3: ESC O <final>       → returns b'O<final>'
+    Two-char: ESC <final>    → returns b'<final>'
+    Each byte read has 50ms timeout to avoid consuming user keystrokes."""
+    r, _, _ = select.select([fd], [], [], 0.05)
+    if not r:
+        return None
+    first = os.read(fd, 1)
+    if not first:
+        return None
+    if first == b"[":  # CSI: read until final byte (0x40-0x7E)
+        seq = first
+        for _ in range(15):
+            r, _, _ = select.select([fd], [], [], 0.05)
+            if not r:
+                break
+            cb = os.read(fd, 1)
+            if not cb:
+                break
+            seq += cb
+            if cb[0] in range(0x40, 0x7F):
+                break
+        return seq
+    if first == b"O":  # SS3: read one more byte
+        r, _, _ = select.select([fd], [], [], 0.05)
+        if r:
+            cb = os.read(fd, 1)
+            if cb:
+                return first + cb
+        return first
+    if first[0] in range(0x40, 0x7F):  # Two-char sequence
+        return first
+    return first
+
+
+def _read_until_paste_end(fd):
+    """Read and echo all characters until \x1b[201~ (bracketed paste end).
+    Returns the pasted content."""
+    chars = []
+    while True:
+        ch = _read_utf8_char(fd)
+        if ch is None:
+            raise EOFError
+        if ch == "\x1b":
+            r, _, _ = select.select([fd], [], [], 0.05)
+            if r:
+                seq = _read_esc_seq(fd)
+                if seq == b"[201~":
+                    return "".join(chars)
+            chars.append(ch)
+            continue
+        if ch == "\x7f":
+            if chars:
+                chars.pop()
+            continue
+        chars.append(ch)
+        sys.stdout.write(ch)
+        sys.stdout.flush()
+
+
+def _read_line_raw(fd):
+    """Read one line in raw mode. Returns the line (without newline)."""
+    chars = []
+    while True:
+        ch = _read_utf8_char(fd)
+        if ch is None:
+            raise EOFError
+        if ch in "\n\r":
+            print()
+            return "".join(chars)
+        if ch == "\x7f":
+            if chars:
+                chars.pop()
+                sys.stdout.write("\b \b")
+                sys.stdout.flush()
+            continue
+        if ch == "\x1b":
+            r, _, _ = select.select([fd], [], [], 0.05)
+            if r:
+                seq = _read_esc_seq(fd)
+                if seq == b"[200~":
+                    paste_content = _read_until_paste_end(fd)
+                    return paste_content
+                # Other CSI/escape sequences — discard
+            elif chars:
+                sys.stdout.write("\b \b" * len(chars))
+                sys.stdout.flush()
+                chars = []
+            continue
+        if ch == "\x03":
+            raise KeyboardInterrupt
+        if ch == "\x04":
+            raise EOFError
+        # Tab is handled explicitly (isprintable=False). All other non-control
+        # characters — including full-width space (U+3000, isprintable=False in
+        # Python for Unicode Separator category) — are accepted here.
+        if ch == "\t" or ch.isprintable() or ch.isspace():
+            chars.append(ch)
+            sys.stdout.write(ch)
+            sys.stdout.flush()
+
+
+def read_user_input(prompt):
+    """Read user input in raw mode. Detects paste instantly, ESC to clear."""
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    print(prompt, end="", flush=True)
+    try:
+        tty.setcbreak(fd)
+        a = termios.tcgetattr(fd)
+        a[3] &= ~(termios.ECHO | termios.ICANON | termios.ISIG)
+        termios.tcsetattr(fd, termios.TCSANOW, a)
+
+        first = _read_line_raw(fd)
+
+        # Drain with progressive timeout: 100ms initial, then 200ms per chunk
+        extra_data = b""
+        r, _, _ = select.select([fd], [], [], 0.1)
+        while r:
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                break
+            extra_data += chunk
+            r, _, _ = select.select([fd], [], [], 0.2)
+
+        # Second pass: if we got data, wait 400ms for any trailing chunks
+        if extra_data:
+            r, _, _ = select.select([fd], [], [], 0.4)
+            while r:
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    break
+                extra_data += chunk
+                r, _, _ = select.select([fd], [], [], 0.2)
+
+        if extra_data:
+            extra = extra_data.decode("utf-8", errors="replace").split("\n")
+            if extra[-1] == "":
+                extra = extra[:-1]
+            lines = [first] + extra if first else extra
+            for l in extra:
+                print(f"  {l}")
+            print("\033[2m（空行で確定）\033[0m")
+            while True:
+                # Drain background paste data before each confirmation read
+                r, _, _ = select.select([fd], [], [], 0)
+                while r:
+                    chunk = os.read(fd, 4096)
+                    if not chunk:
+                        break
+                    extra_data += chunk
+                    r, _, _ = select.select([fd], [], [], 0)
+                if extra_data:
+                    more_parts = (
+                        extra_data.decode("utf-8", errors="replace")
+                        .rstrip("\n")
+                        .split("\n")
+                    )
+                    extra_data = b""
+                    for mp in more_parts:
+                        lines.append(mp)
+                        print(f"  {mp}")
+                more = _read_line_raw(fd)
+                if not more:
+                    break
+                lines.append(more)
+            return "\n".join(lines).strip()
+
+        if not first:
+            return None
+        return first.strip()
+
+    except (KeyboardInterrupt, EOFError):
+        raise
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except:
+            pass
 
 
 def _strip_think(text_iter, no_think, in_think=False):
@@ -267,10 +476,12 @@ def main():
     messages = [{"role": "system", "content": SYSTEM}]
     while True:
         try:
-            user = input("\n\033[1;36mあなた>\033[0m ").strip()
+            user = read_user_input("\n\033[1;36mあなた>\033[0m ")
         except (EOFError, KeyboardInterrupt):
             print("\n終了します。")
             break
+        if user is None:
+            continue
         if user.lower() in ("exit", "quit"):
             print("終了します。")
             break
@@ -460,7 +671,7 @@ def main():
         hit = f", 命中率{cache.hit_rate * 100:.0f}%" if cache else ""
         think_info = f"思考 {think_s:.1f}s ／ " if think_s > 0 else ""
         print(
-            f"\n\033[2m（{think_info}{pf_info}{n} tokens, {n / elapsed:.1f} tok/s{hit}）\033[0m"
+            f"\n\033[2m（{think_info}{pf_info}出力 {n} tokens, {n / elapsed:.1f} tok/s{hit}）\033[0m"
         )
         messages.append({"role": "assistant", "content": resp})
 
