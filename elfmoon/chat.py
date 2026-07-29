@@ -314,6 +314,35 @@ def _strip_think(text_iter, no_think, in_think=False):
         yield buf
 
 
+def _warn_if_too_large_without_store(model_path, store_dir):
+    """store 未検出のままオンメモリ動作に入ると危険な規模なら警告する。
+
+    store を別ドライブに置いた構成でパスを取り違えると、ストリーミングが黙って
+    無効化され巨大モデルを丸ごとロードして OOM kill される（原因が分かりにくい）。
+    """
+    try:
+        from resident_cache import budget_bytes_from_env
+
+        total = sum(
+            os.path.getsize(os.path.join(model_path, f))
+            for f in os.listdir(model_path)
+            if f.endswith(".safetensors")
+        )
+        budget = budget_bytes_from_env()
+    except Exception:
+        return
+    if total <= budget:
+        return
+    print(
+        f"\n⚠️  store/ が見つからないためストリーミングを使いません: {store_dir}\n"
+        f"   モデル {total / 1024**3:.0f}GB > 利用可能 {budget / 1024**3:.0f}GB のため、"
+        f"このままでは強制終了(OOM)する可能性が高いです。\n"
+        f"   ELFMOON_STORE_DIR / ELFMOON_STORE_ROOT128 の指定、または "
+        f"integrate.py split_all による store 生成を確認してください。\n",
+        flush=True,
+    )
+
+
 def main():
     argv = sys.argv[1:]
 
@@ -466,19 +495,19 @@ def main():
                 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
                 tok = TokenizerWrapper(tok, eos_token_ids=__eos_ids)
-        if _model_type == "gemma4" or not os.path.isdir(
-            os.path.join(model_path, "store")
-        ):
+        # store の在処は resolve_model が決める（内蔵SSD等、モデルディレクトリ外も可）。
+        # ここで model_path/store を直に見ると store 別置き構成でストリーミングが
+        # 無効化され、巨大モデルを丸ごとロードして OOM kill される。
+        if _model_type == "gemma4" or not os.path.isdir(store_dir):
             cache = None
+            _warn_if_too_large_without_store(model_path, store_dir)
         else:
             cache, _ = wire_streaming(
                 model, cap, perf=perf, store_dir=store_dir, model_path=model_path
             )
 
     # mx.compile: 全denseモデルを高速化（streaming MoE は store/ があるので除外）
-    if _model_type != "deepseek_v4" and not os.path.isdir(
-        os.path.join(model_path, "store")
-    ):
+    if _model_type != "deepseek_v4" and not os.path.isdir(store_dir):
         try:
             mx.compile(model.__call__)
         except Exception:

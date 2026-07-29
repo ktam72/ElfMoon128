@@ -91,6 +91,16 @@ def resolve_model(name=None):
     name = name or os.environ.get("ELFMOON_MODEL", DEFAULT_MODEL_NAME)
     model_path = os.path.join(MODELS_ROOT, name)
     store_dir = os.path.join(model_path, "store")
+    # store をモデル本体と別ドライブに置く構成（decode は I/O 律速のため、モデルを
+    # 外付けに置き store だけ内蔵SSDに置くと速い）。STORE_ROOT/<モデル名>/store を
+    # 実在する場合のみ採用し、既定の規約（モデル直下 store/）を壊さない。
+    store_root = os.environ.get("ELFMOON_STORE_ROOT128") or os.environ.get(
+        "ELFMOON_STORE_ROOT"
+    )
+    if store_root and not os.path.isdir(store_dir):
+        alt = os.path.join(store_root, name, "store")
+        if os.path.isdir(alt):
+            store_dir = alt
     return model_path, store_dir
 
 
