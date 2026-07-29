@@ -18,6 +18,7 @@
 import logging
 import fcntl
 import os
+import re
 import select
 import sys
 import termios
@@ -314,6 +315,26 @@ def _strip_think(text_iter, no_think, in_think=False):
         yield buf
 
 
+def _think_kwargs(model_type, no_think):
+    """思考モード抑制のテンプレート引数を返す（引数名がモデルで異なる）。
+
+    Kimi K3 は独自トークナイザ(encoding_k3)で引数名が `thinking`。汎用の
+    `enable_thinking` は **kwargs に落ちて黙って無視されるため、--no-think が
+    効かない。thinking=False で think チャネル自体がプロンプトから消える。
+    """
+    if model_type == "kimi_k3":
+        return {"thinking": not no_think}
+    return {"enable_thinking": not no_think}
+
+
+# Kimi K3 のチャネル制御トークン。表示上のノイズなので出力から取り除く。
+_K3_CTRL = re.compile(
+    r"<\|close\|>(?:think|response|message)?(?:<\|sep\|>)?"
+    r"|<\|open\|>(?:think|response|message)?(?:<\|sep\|>)?"
+    r"|<\|sep\|>|<\|end_of_msg\|>"
+)
+
+
 def _warn_if_too_large_without_store(model_path, store_dir):
     """store 未検出のままオンメモリ動作に入ると危険な規模なら警告する。
 
@@ -546,7 +567,7 @@ def main():
                 messages,
                 add_generation_prompt=True,
                 tokenize=False,
-                enable_thinking=not no_think,
+                **_think_kwargs(_model_type, no_think),
             )
 
         print("\033[1;32mElfMoon>\033[0m ", end="", flush=True)
@@ -605,7 +626,7 @@ def main():
                             messages,
                             add_generation_prompt=False,
                             tokenize=False,
-                            enable_thinking=not no_think,
+                            **_think_kwargs(_model_type, no_think),
                         )
                         nogen_ids = tok.encode(nogen)
                         boundary = 0
@@ -672,6 +693,11 @@ def main():
                 if _in_think:
                     print("\033[2m（思考中…）\033[0m", end="", flush=True)
                 for piece in _strip_think(_texts(), no_think, in_think=_in_think):
+                    if _model_type == "kimi_k3":
+                        # チャネル制御トークンは表示上のノイズなので落とす
+                        piece = _K3_CTRL.sub("", piece)
+                        if not piece:
+                            continue
                     if answer_t == 0.0:
                         answer_t = time.perf_counter()
                         if _in_think:
