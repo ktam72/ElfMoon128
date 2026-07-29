@@ -429,28 +429,43 @@ def main():
         _mp = Path(model_path)
         model, _ = load_model(_mp, lazy=True)
         # トークナイザのロード（カスタムtokenizer_class対応）
-        try:
-            _, tok = load(model_path, lazy=True)
-        except Exception:
-            from transformers import PreTrainedTokenizerFast
-            from tokenizers import Tokenizer
-
-            tk = Tokenizer.from_file(str(_mp / "tokenizer.json"))
-            tok = PreTrainedTokenizerFast(tokenizer_object=tk)
-            ct_path = _mp / "chat_template.jinja"
-            if ct_path.exists():
-                tok.chat_template = ct_path.read_text()
-            # config.json から EOS トークンを動的設定
-            import json
-
-            with open(_mp / "config.json") as __cfgf:
-                __cfg = json.load(__cfgf)
-            __eos_raw = __cfg.get("eos_token_id", 1)
-            __eos_ids = __eos_raw if isinstance(__eos_raw, list) else [__eos_raw]
-            tok.eos_token_id = __eos_ids[0]
+        # tokenizer.json を持たずカスタムコード経由のみのモデル（例: Kimi K3 の
+        # encoding_k3.py/tiktoken）は mlx_lm.load() 内の AutoTokenizer 呼び出しが
+        # trust_remote_code なしで対話プロンプトを出して止まるため、先に弾いて
+        # trust_remote_code=True 経路へ直行する。
+        if not (_mp / "tokenizer.json").exists():
+            from transformers import AutoTokenizer
             from mlx_lm.tokenizer_utils import TokenizerWrapper
 
-            tok = TokenizerWrapper(tok, eos_token_ids=__eos_ids)
+            _tok_hf = AutoTokenizer.from_pretrained(
+                model_path, trust_remote_code=True
+            )
+            __eos_ids = getattr(_tok_hf, "eos_token_id", None)
+            __eos_ids = __eos_ids if isinstance(__eos_ids, list) else [__eos_ids]
+            tok = TokenizerWrapper(_tok_hf, eos_token_ids=__eos_ids)
+        else:
+            try:
+                _, tok = load(model_path, lazy=True)
+            except Exception:
+                from transformers import PreTrainedTokenizerFast
+                from tokenizers import Tokenizer
+
+                tk = Tokenizer.from_file(str(_mp / "tokenizer.json"))
+                tok = PreTrainedTokenizerFast(tokenizer_object=tk)
+                ct_path = _mp / "chat_template.jinja"
+                if ct_path.exists():
+                    tok.chat_template = ct_path.read_text()
+                # config.json から EOS トークンを動的設定
+                import json
+
+                with open(_mp / "config.json") as __cfgf:
+                    __cfg = json.load(__cfgf)
+                __eos_raw = __cfg.get("eos_token_id", 1)
+                __eos_ids = __eos_raw if isinstance(__eos_raw, list) else [__eos_raw]
+                tok.eos_token_id = __eos_ids[0]
+                from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+                tok = TokenizerWrapper(tok, eos_token_ids=__eos_ids)
         if _model_type == "gemma4" or not os.path.isdir(
             os.path.join(model_path, "store")
         ):

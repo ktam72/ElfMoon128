@@ -947,6 +947,75 @@ def _adapt_compound_gate(gate):
     )
 
 
+class StreamingSwitchGLU(nn.Module):
+    """SwitchGLU 互換のストリーミング差し替え。
+
+    MoE ブロック全体ではなく `switch_mlp` 属性だけを置換するため、モデル固有の
+    ルーティングや latent 射影（Kimi K3 の routed_expert_down/up_proj 等）を
+    純正実装のまま残せる。契約は SwitchGLU と同一:
+    (x[..., D], indices[..., k]) -> [..., k, D]（重み付け・総和は呼び出し側）。
+    """
+
+    def __init__(
+        self, layer_idx, store, cache, activation, group_size, bits, mode
+    ):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self._store = store
+        self._cache = cache
+        self.activation = activation
+        self.group_size = group_size
+        self.bits = bits
+        self.mode = mode
+
+    def __call__(self, x, indices):
+        ishp = indices.shape
+        K = ishp[-1]
+        D = x.shape[-1]
+        xf = x.reshape(-1, D)
+        idxf = indices.reshape(-1, K)
+        mx.eval(idxf)
+        idx_l = idxf.tolist()
+        N = len(idx_l)
+
+        groups = {}
+        for t in range(N):
+            row = idx_l[t]
+            for j in range(K):
+                groups.setdefault(int(row[j]), []).append(t * K + j)
+
+        out = mx.zeros((N * K, D), dtype=xf.dtype)
+        for e, flat in groups.items():
+            exp = self._cache.get(
+                (self.layer_idx, e),
+                lambda e=e: self._store.load(self.layer_idx, e),
+            )
+            xb = xf[mx.array([f // K for f in flat])]
+            qm = lambda p: mx.quantized_matmul(  # noqa: E731
+                xb,
+                exp[f"{p}.wq"],
+                exp[f"{p}.s"],
+                exp.get(f"{p}.b"),
+                transpose=True,
+                group_size=self.group_size,
+                bits=self.bits,
+                mode=self.mode,
+            )
+            h = self.activation(qm("up"), qm("gate"))
+            yo = mx.quantized_matmul(
+                h,
+                exp["down.wq"],
+                exp["down.s"],
+                exp.get("down.b"),
+                transpose=True,
+                group_size=self.group_size,
+                bits=self.bits,
+                mode=self.mode,
+            )
+            out = out.at[mx.array(flat)].add(yo.astype(out.dtype))
+        return out.reshape(*ishp, D)
+
+
 def wire_streaming(
     model,
     capacity=None,
@@ -1035,7 +1104,8 @@ def wire_streaming(
     layers = (
         getattr(model, "layers", None)
         or getattr(model.model, "layers", None)
-        or getattr(model.language_model, "layers", None)
+        or getattr(getattr(model, "language_model", None), "layers", None)
+        or getattr(getattr(getattr(model, "language_model", None), "model", None), "layers", None)
     )
     n_dense = 0
     last_moe = None
@@ -1064,6 +1134,22 @@ def wire_streaming(
                 fused_store=fused_store,
                 gsc=gsc,
             )
+        elif hasattr(mlp, "switch_mlp") and hasattr(mlp, "routed_expert_down_proj"):
+            # Kimi K3 系: expert は hidden ではなく latent 空間で動き、ルーティングも
+            # モデル固有（group select）。MoE ブロックごと置換すると latent 射影と
+            # shared expert を失うため、switch_mlp 属性だけを差し替える。
+            _sm = mlp.switch_mlp
+            _gp = _sm.gate_proj
+            mlp.switch_mlp = StreamingSwitchGLU(
+                l,
+                store,
+                cache,
+                _sm.activation,
+                getattr(_gp, "group_size", GROUP),
+                getattr(_gp, "bits", BITS),
+                getattr(_gp, "mode", "affine"),
+            )
+            continue
         elif hasattr(mlp, "switch_mlp"):
             n_exp = mlp.switch_mlp.gate_proj.weight.shape[0]
             gate = mlp.gate
@@ -1077,6 +1163,13 @@ def wire_streaming(
             _adapted = _adapt_compound_gate(gate)
             if _adapted is not None:
                 gate, _act, correction_bias, routing_scale, _norm = _adapted
+            # expert の実量子化パラメータを検出する。ExpertStore は元の switch_mlp を
+            # そのままスライス保存するため、既定の GROUP=64/BITS=4 と異なるモデル
+            # （例: Kimi K3 UVMAX の bits=2/group_size=128）では decode が壊れる。
+            _gp = mlp.switch_mlp.gate_proj
+            _group_size = getattr(_gp, "group_size", GROUP)
+            _bits = getattr(_gp, "bits", BITS)
+            _qmode = getattr(_gp, "mode", "affine")
             layer.mlp = StreamingMoE(
                 l,
                 gate,
@@ -1090,6 +1183,9 @@ def wire_streaming(
                 correction_bias=correction_bias,
                 routing_scale=routing_scale,
                 norm=_norm,
+                group_size=_group_size,
+                bits=_bits,
+                mode=_qmode,
                 fused_store=fused_store,
                 gsc=gsc,
             )
