@@ -114,6 +114,18 @@ echo 'export ELFMOON_MODELS_ROOT128=/Volumes/990Pro_2TB/elfmoon128/models' >> ~/
 
 ディレクトリ規約（`<モデル名>/config.json, *.safetensors, store/`）は ElfMoon4 と同一。
 
+### store を別ドライブに置く（ELFMOON_STORE_ROOT128）
+
+decode は expert ストリーミングの I/O 律速のため、**モデル本体を外付け SSD に置き、`store/` だけ内蔵 SSD に置く**構成が速い。`ELFMOON_STORE_ROOT128` を設定すると `<ルート>/<モデル名>/store` を自動で解決する（実在する場合のみ採用するため、モデル直下 `store/` の既定規約は変わらない）。
+
+```bash
+echo 'export ELFMOON_STORE_ROOT128=~/.elfmoon128_store' >> ~/.zshrc
+```
+
+単発で指定する場合は従来どおり `ELFMOON_MODEL_DIR` + `ELFMOON_STORE_DIR`（`--model` は付けない）。
+
+> ⚠️ store のパスを取り違えるとストリーミングが無効化され、巨大モデルを丸ごとロードして強制終了(OOM)する。起動時に `実効容量 …` の行が出ていればストリーミングは有効。出ていなければ store が解決できていない。
+
 ### 常駐キャッシュ容量（自動導出）
 
 ElfMoon4 は常駐 expert 数を固定値 6144 としていたが、ElfMoon128 では **メモリ予算から自動導出**する（大規模 MoE では 1 expert のバイト数がモデルごとに大きく変わり、スロット数固定では実メモリ使用量が破綻するため）。
