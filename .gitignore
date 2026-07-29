@@ -7,7 +7,12 @@ elfmoon/spike/
 ref-ds4/
 
 # 設計ドキュメント・変更記録（コミット対象外）
-evidence/
+# evidence は原則ローカル限り。README から参照する動作記録のみ公開する。
+# 親ディレクトリを除外すると git が中を辿らないため段階的に開ける。
+evidence/*
+!evidence/elfmoon128/
+evidence/elfmoon128/*
+!evidence/elfmoon128/kimi-k3-2bit-uvmax.md
 # docs/  ← 設計ドキュメントは追跡対象に含める
 
 # ログ・一時ファイル

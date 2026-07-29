@@ -47,6 +47,25 @@
 
 > - 未検証だが同経路で動作見込み: Qwen3-235B-A22B-Thinking / Qwen3-Coder-480B-A35B（252GB）/ GLM-4.6（185GB）。
 > - n_group>1（Kimi-K2 / Ring-1T 等）は現状のグループルーティング未対応。
+
+### Kimi K3 非刈込ティア（761GB）を 128GB 機で動作
+
+**モデルサイズの 1/6 に満たないメモリで 761GB の MoE を走らせ、一貫した応答を得た。** モデルは [kernelpool/Kimi-K3-2bit-UVMAX](https://huggingface.co/kernelpool/Kimi-K3-2bit-UVMAX)（896 experts 無刈込・混合精度）。
+
+> 本モデル自体は作者が [PR #1626](https://github.com/ml-explore/mlx-lm/pull/1626) で 3.58 tok/s の生成を報告済み（オンメモリ想定）。ElfMoon128 の主張は **128GB という桁違いに小さいメモリで同じ非刈込ティアを動かした**点にある。
+
+| 項目 | 値 |
+|---|---|
+| モデル / store | 761 GB / 713 GB（92 MoE 層 × 896 experts = 82,432 ファイル） |
+| 常駐率 | **7.7%**（6,394 / 83,328 expert） |
+| デコード | **0.38〜0.41 tok/s** |
+| 出力 | 74 トークンで EOS 到達・クリーン終了（ループなし） |
+
+> ⚠️ **実用速度ではない（デモンストレーション）。** top16 × 92 層 ≈ 1,472 expert 読み／トークンに対し常駐率 7.7% のため、decode がほぼ全域 SSD I/O 律速になる。実運用は上表の Qwen3-235B / GLM-4.7 を推奨。
+
+配線の正しさは出力文ではなく数値で裏付けている: 純正 `SwitchGLU` と同一入力を与えた比較で **max abs diff 0.0027**（参照値の絶対平均 1.43 に対し相対 0.02% ＝ fp16 の丸め誤差レベル）。
+
+Kimi K3 は routed expert を hidden(7168) ではなく **latent 空間(3584)** で動かし、独自の group routing を持つ。MoE ブロックごと差し替える従来方式では固有構造を失うため、`SwitchGLU` 互換の `StreamingSwitchGLU` で **`switch_mlp` 属性のみ**を差し替える方式を新設した（モデル固有部分は mlx-lm 純正のまま残る）。詳細・再現手順は [`evidence/elfmoon128/kimi-k3-2bit-uvmax.md`](evidence/elfmoon128/kimi-k3-2bit-uvmax.md)。mlx-lm 未マージの [PR #1626](https://github.com/ml-explore/mlx-lm/pull/1626) の配置が必要。
 > - 128GB 超 MoE の候補一覧は [`evidence/elfmoon128/moe-candidates-over-128gb.md`](evidence/elfmoon128/moe-candidates-over-128gb.md) を参照。
 
 ### 参考: 108GiB 内でオンメモリ動作するモデル
