@@ -14,17 +14,27 @@ M5 Max 128GB, ElfMoon128。**モデルサイズ 761GB に対し 128GB のメモ�
 |---|---|
 | モデル | [kernelpool/Kimi-K3-2bit-UVMAX](https://huggingface.co/kernelpool/Kimi-K3-2bit-UVMAX) 761GB |
 | store | 713GB / 82,432 ファイル（92 MoE 層 × 896 experts）内蔵 SSD |
-| 常駐 | 6,394 / 83,328 expert = **7.7%**（予算120GB×0.85 − 非expert46.7GB） |
-| デコード | **0.38〜0.41 tok/s**（ウォーム 6,394 expert プライム時 0.409） |
-| 出力 | 74 トークンで EOS 到達・クリーン終了。ループなし |
+| 常駐 | 3,925 / 83,328 = 4.7%（省メモリ既定）/ 6,394 = 7.7%（`--perf`） |
+| デコード | **1.1 tok/s**（chat.py, 462 トークン生成, 命中率 52%, 省メモリ既定） |
+| プリフィル | 1.0 tok/s（130 トークン） |
+| 出力 | 日本語で自然な応答。EOS 到達・ループなし |
 
-出力（max_tokens=200 指定だが 74 で自然終了。思考チャネル構造も正常）:
+短い生成ではプリフィルとウォームアップが分母を支配し 0.38〜0.41 tok/s に見える
+（40〜74 トークン計測時）。462 トークンまで回した 1.1 tok/s が定常値。
+
+chat.py 実測ログ（自己紹介を依頼、462 トークン）:
 
 ```
-The user is asking a simple factual question: the capital city of France. ...
-The capital of France is Paris.
-<|close|>think<|sep|><|open|>response<|sep|>The capital city of France is Paris.<|close|>response ... <|end_of_msg|>
+  省メモリモード: 実効容量 3925（34.0GB） ← 予算108GB×0.75 − 非expert46.7GB / expert8.86MB, 上限83328
+  ウォームスタート: 3925 experts プライム（16秒）
+準備完了（36秒）
+...
+<|open|>response<|sep|>こんにちは！初めまして、Claude と申します。…
+（プリフィル 130tok 1tok/s ／ 出力 462 tokens, 1.1 tok/s, 命中率52%）
 ```
+
+think チャネル → response チャネル → `<|end_of_msg|>` の構造が正常に出ており、
+長文でも破綻しない。なお本ビルドは自己紹介で "Claude" と名乗る（蒸留由来と思われる）。
 
 > 0.38 tok/s は実用速度ではない。top16 × 92層 ≈ 1,472 expert 読み/トークンに対し
 > 常駐率 7.7% のため、decode がほぼ全域 SSD I/O 律速になる。デモとしての意義。
