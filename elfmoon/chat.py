@@ -427,6 +427,12 @@ def main():
         # Agents-A1 推奨: temp=0.85, top_p=0.95, top_k=20（presence_penalty は未対応）
         TEMP = 0.85
         _sampler_kwargs = dict(temp=TEMP, top_p=0.95, top_k=20)
+    elif _model_type == "deepseek_v4":
+        # DeepSeek-V4-Flash 公式推奨: temp=1.0, top_p=0.95（agentic 以外は top_p=1.0）
+        # 低温度では logits ピークが固定され同一トークン列の自己増殖ループ
+        # （newcome mode collapse）が起きやすいため、公式推奨値に従う。
+        TEMP = 1.0
+        _sampler_kwargs = dict(temp=TEMP, top_p=0.95, top_k=64)
     else:
         TEMP = 0.4
 
@@ -612,23 +618,48 @@ def main():
         try:
             if _model_type == "deepseek_v4":
                 from model_v4 import _sample
-                from mlx_lm.sample_utils import make_repetition_penalty
+                from collections import Counter
 
                 # newcome 自己増殖ループ（既知の mode collapse）抑制のため
-                # repetition penalty を適用。ELFMOON_V4_RP=0 で無効化可能。
-                _rp = float(os.environ.get("ELFMOON_V4_RP", "1.5"))
-                _rp_proc = (
-                    make_repetition_penalty(penalty=_rp, context_size=24)
-                    if _rp > 0
-                    else None
-                )
-                # 早発崩壊はより強い penalty で 1 回だけ再生成する
-                _rp_retry = make_repetition_penalty(penalty=1.6, context_size=24)
+                # 累積 repetition penalty を適用。ELFMOON_V4_RP=0 で無効化可能。
+                # 標準 RP は「窓内に出現しただけで 1 回分」しかペナルティしないため、
+                # 崩壊トークン（何度も出現する）を止められない。
+                # ここでは出現回数 count に応じて penalty^min(count-1, max_exp) で累積強化し、
+                # 自己増殖するトークンを確実に抑制する。窓は広く（1024）。
+                # ペナルティ 1.8 / max_exp 6 は崩壊頻度低減のための強化値。
+                _rp = float(os.environ.get("ELFMOON_V4_RP", "1.8"))
+                _rp_context = int(os.environ.get("ELFMOON_V4_RP_CTX", "1024"))
+                _rp_max_exp = int(os.environ.get("ELFMOON_V4_RP_MAXEXP", "6"))
+
+                def _v4_make_rp(penalty, context_size, max_exp=_rp_max_exp):
+                    """出現回数で累積強化する repetition penalty processor。
+                    窓内に count 回出現したトークンの logits を
+                    penalty^min(count-1, max_exp) で減衰する。"""
+
+                    def proc(tokens, logits):
+                        if not tokens:
+                            return logits
+                        counts = Counter(tokens[-context_size:])
+                        for t, c in counts.items():
+                            if c < 2:
+                                continue
+                            eff = penalty ** min(c - 1, max_exp)
+                            logits[0, t] = mx.where(
+                                logits[0, t] < 0,
+                                logits[0, t] * eff,
+                                logits[0, t] / eff,
+                            )
+                        return logits
+
+                    return proc
+
+                _rp_proc = _v4_make_rp(_rp, _rp_context) if _rp > 0 else None
                 MAX_V4 = min(512, MAX_TOKENS)
                 _answer_ref = [0.0]
 
                 def _v4_generate(ids, rp_proc):
-                    """ストリーミング生成。崩壊検出で停止し (new_ids, collapsed) を返す。"""
+                    """ストリーミング生成。各トークンを即時表示し、崩壊検出で停止する。
+                    崩壊検出で停止し (new_ids, collapsed) を返す。"""
                     all_ids = list(ids)
                     new_ids = []
                     logits = model.forward(mx.array([all_ids], mx.int32), start_pos=0)
@@ -641,6 +672,7 @@ def main():
                     if piece:
                         print(piece, end="", flush=True)
                     run, last_tok = 1, next_tok
+                    ascii_run = 0
                     collapsed = False
                     while len(new_ids) < MAX_V4:
                         if next_tok == tok.eos_token_id:
@@ -656,32 +688,41 @@ def main():
                             run += 1
                         else:
                             run, last_tok = 1, next_tok
-                        if run >= 5:
-                            # 同一トークン連続 5 個で自己増殖ループ（mode collapse）と判定して停止
+                        if run >= 6:
+                            # 同一トークン連続 6 個で自己増殖ループ（mode collapse）と判定して停止
+                            if os.environ.get("ELFMOON_V4_DEBUG"):
+                                _lp = mx.squeeze(logits)
+                                _top = mx.argsort(-_lp)[:5]
+                                _top = [int(t.item()) for t in _top]
+                                _top_txt = " | ".join(
+                                    f"{tok.decode([t])!r}({t})" for t in _top
+                                )
+                                sys.stderr.write(
+                                    f"[DBG] run>=6 near tok {len(new_ids)}: "
+                                    f"last={tok.decode([last_tok])!r}({last_tok}) "
+                                    f"top5={_top_txt}\n"
+                                )
+                            collapsed = True
+                            break
+                        piece = tok.decode([next_tok], skip_special_tokens=True)
+                        # 先頭スペース付きの英字トークン（' newcom' 等）も検出対象にする
+                        if piece and re.fullmatch(r"\s?[A-Za-z]{4,}", piece):
+                            ascii_run += 1
+                        else:
+                            ascii_run = 0
+                        if ascii_run >= 4:
+                            # 英字のみトークンの連続（newcom→newcommer→newcomerce 等の
+                            # 似て非なるガラクタ連鎖）を mode collapse と判定して停止
                             collapsed = True
                             break
                         all_ids.append(next_tok)
                         new_ids.append(next_tok)
-                        piece = tok.decode([next_tok], skip_special_tokens=True)
                         if piece:
                             print(piece, end="", flush=True)
-                    if collapsed:
-                        # 崩壊テール（末尾の同一トークン連続）を切り落とす
-                        tail = new_ids[-1]
-                        cut = len(new_ids)
-                        while cut > 0 and new_ids[cut - 1] == tail:
-                            cut -= 1
-                        new_ids = new_ids[:cut]
                     return new_ids, collapsed
 
                 ids = tok.encode(prompt)
                 new_ids, collapsed = _v4_generate(ids, _rp_proc)
-                if collapsed and len(new_ids) < 48:
-                    # 早発崩壊（短い出力での自己増殖）は penalty 強化で再生成する。
-                    # 出力が 1 行内に収まる想定なので行をクリアしてから描き直す。
-                    print("\r\033[K\033[1;32mElfMoon>\033[0m ", end="", flush=True)
-                    _answer_ref[0] = 0.0
-                    new_ids, collapsed = _v4_generate(ids, _rp_retry)
                 if collapsed:
                     print("（繰り返し検出のため停止）", flush=True)
                 answer_t = _answer_ref[0]
