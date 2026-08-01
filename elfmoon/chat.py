@@ -436,13 +436,32 @@ def main():
     t0 = time.perf_counter()
 
     if _model_type == "deepseek_v4":
-        from model_v4 import DeepseekV4Model
+        # v4 モデルは部分常駐ストリーミング実装（mlx_v4）を使用する。
+        # 旧 model_v4.DeepseekV4Model は旧命名（model. プレフィックス/lm_head）
+        # 前提のため現在のフラット命名 store と非互換。
+        _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if _root not in sys.path:
+            sys.path.insert(0, _root)
+        from elfmoon.v4.mlx_v4 import load_v4_streaming
+        from elfmoon.v4.ref_model import build_args
 
-        model = DeepseekV4Model(model_path, fused_quant=True)
-        cache = None
-        from transformers import AutoTokenizer
+        enc_dir = os.path.join(model_path, "encoding")
+        if not os.path.isdir(enc_dir):
+            base = re.sub(r"-mlx(-2bit)?$", "", os.path.basename(model_path))
+            alt = os.path.join(os.path.dirname(model_path), base, "encoding")
+            if os.path.isdir(alt):
+                enc_dir = alt
+        if os.path.isdir(enc_dir) and enc_dir not in sys.path:
+            sys.path.insert(0, enc_dir)
 
-        tok = AutoTokenizer.from_pretrained(model_path)
+        with open(os.path.join(model_path, "config.json")) as f:
+            _v4cfg = json.load(f)
+        model, cache, _store = load_v4_streaming(
+            model_path, build_args(_v4cfg), capacity=cap, perf=perf
+        )
+        from mlx_lm.utils import load_tokenizer
+
+        tok = load_tokenizer(model_path)
     elif _model_type == "laguna" or "laguna" in os.path.basename(model_path).lower():
         from laguna_opt import Model as OptimizedLagunaModel, ModelArgs
 
@@ -487,9 +506,7 @@ def main():
             from transformers import AutoTokenizer
             from mlx_lm.tokenizer_utils import TokenizerWrapper
 
-            _tok_hf = AutoTokenizer.from_pretrained(
-                model_path, trust_remote_code=True
-            )
+            _tok_hf = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
             __eos_ids = getattr(_tok_hf, "eos_token_id", None)
             __eos_ids = __eos_ids if isinstance(__eos_ids, list) else [__eos_ids]
             tok = TokenizerWrapper(_tok_hf, eos_token_ids=__eos_ids)
@@ -538,7 +555,15 @@ def main():
         f"準備完了（{time.perf_counter() - t0:.0f}秒）。会話をどうぞ。'exit' か Ctrl-D で終了。\n"
     )
 
-    messages = [{"role": "system", "content": SYSTEM}]
+    # 上位モデル（deepseek_v4）は英語の coding-assistant システムプロンプトで
+    # mode collapse が頻発するため、日本語のニュートラルなシステムに置き換える。
+    if _model_type == "deepseek_v4":
+        _system = (
+            "あなたは優秀なAIアシスタントです。日本語で簡潔・正確に回答してください。"
+        )
+    else:
+        _system = SYSTEM
+    messages = [{"role": "system", "content": _system}]
     while True:
         try:
             user = read_user_input("\n\033[1;36mあなた>\033[0m ")
@@ -560,7 +585,12 @@ def main():
         if _model_type == "deepseek_v4":
             from encoding_dsv4 import encode_messages
 
-            thinking_mode = "chat" if no_think else "thinking"
+            # 上位モデルは思考ブロック生成時に頻繁に mode collapse するため、
+            # デフォルトは思考なし（chat）応答を採用。思考は ELFMOON_V4_THINK=1 で opt-in。
+            if no_think or os.environ.get("ELFMOON_V4_THINK") != "1":
+                thinking_mode = "chat"
+            else:
+                thinking_mode = "thinking"
             prompt = encode_messages(messages, thinking_mode=thinking_mode)
         else:
             prompt = tok.apply_chat_template(
@@ -574,25 +604,87 @@ def main():
         resp, t, answer_t = "", time.perf_counter(), 0.0
         n = 0
         think_s = 0.0
+        _prefill_n = 0
+        _prefill_t0 = None
+        _prefill_t1_ref = [None]
+        _kvc_save_ids, _kvc_snap = None, None
 
         try:
             if _model_type == "deepseek_v4":
+                from model_v4 import _sample
+                from mlx_lm.sample_utils import make_repetition_penalty
+
+                # newcome 自己増殖ループ（既知の mode collapse）抑制のため
+                # repetition penalty を適用。ELFMOON_V4_RP=0 で無効化可能。
+                _rp = float(os.environ.get("ELFMOON_V4_RP", "1.5"))
+                _rp_proc = (
+                    make_repetition_penalty(penalty=_rp, context_size=24)
+                    if _rp > 0
+                    else None
+                )
+                # 早発崩壊はより強い penalty で 1 回だけ再生成する
+                _rp_retry = make_repetition_penalty(penalty=1.6, context_size=24)
+                MAX_V4 = min(512, MAX_TOKENS)
+                _answer_ref = [0.0]
+
+                def _v4_generate(ids, rp_proc):
+                    """ストリーミング生成。崩壊検出で停止し (new_ids, collapsed) を返す。"""
+                    all_ids = list(ids)
+                    new_ids = []
+                    logits = model.forward(mx.array([all_ids], mx.int32), start_pos=0)
+                    next_tok = int(_sample(logits[0, -1:], TEMP, top_p=0.9).item())
+                    all_ids.append(next_tok)
+                    new_ids.append(next_tok)
+                    if _answer_ref[0] == 0.0:
+                        _answer_ref[0] = time.perf_counter()
+                    piece = tok.decode([next_tok], skip_special_tokens=True)
+                    if piece:
+                        print(piece, end="", flush=True)
+                    run, last_tok = 1, next_tok
+                    collapsed = False
+                    while len(new_ids) < MAX_V4:
+                        if next_tok == tok.eos_token_id:
+                            break
+                        logits = model.forward(
+                            mx.array([[all_ids[-1]]], mx.int32),
+                            start_pos=len(all_ids) - 1,
+                        )
+                        if rp_proc is not None:
+                            logits = rp_proc(new_ids, logits[0, -1:])
+                        next_tok = int(_sample(logits, TEMP, top_p=0.9).item())
+                        if next_tok == last_tok:
+                            run += 1
+                        else:
+                            run, last_tok = 1, next_tok
+                        if run >= 5:
+                            # 同一トークン連続 5 個で自己増殖ループ（mode collapse）と判定して停止
+                            collapsed = True
+                            break
+                        all_ids.append(next_tok)
+                        new_ids.append(next_tok)
+                        piece = tok.decode([next_tok], skip_special_tokens=True)
+                        if piece:
+                            print(piece, end="", flush=True)
+                    if collapsed:
+                        # 崩壊テール（末尾の同一トークン連続）を切り落とす
+                        tail = new_ids[-1]
+                        cut = len(new_ids)
+                        while cut > 0 and new_ids[cut - 1] == tail:
+                            cut -= 1
+                        new_ids = new_ids[:cut]
+                    return new_ids, collapsed
+
                 ids = tok.encode(prompt)
-                ids_arr = mx.array(ids, dtype=mx.int64)
-                new_ids = []
-                answer_t = 0.0
-                MAX_V4 = min(512, MAX_TOKENS)  # 0.3 tok/s では少量ずつ
-                for token_id in model.generate_stream(
-                    ids_arr,
-                    max_new=MAX_V4,
-                    temperature=TEMP,
-                    top_p=0.9,
-                ):
-                    new_ids.append(token_id)
-                    if answer_t == 0.0:
-                        answer_t = time.perf_counter()
-                    piece = tok.decode([token_id], skip_special_tokens=True)
-                    print(piece, end="", flush=True)
+                new_ids, collapsed = _v4_generate(ids, _rp_proc)
+                if collapsed and len(new_ids) < 48:
+                    # 早発崩壊（短い出力での自己増殖）は penalty 強化で再生成する。
+                    # 出力が 1 行内に収まる想定なので行をクリアしてから描き直す。
+                    print("\r\033[K\033[1;32mElfMoon>\033[0m ", end="", flush=True)
+                    _answer_ref[0] = 0.0
+                    new_ids, collapsed = _v4_generate(ids, _rp_retry)
+                if collapsed:
+                    print("（繰り返し検出のため停止）", flush=True)
+                answer_t = _answer_ref[0]
                 n = len(new_ids)
                 resp = tok.decode(new_ids, skip_special_tokens=True)
             else:
@@ -612,9 +704,6 @@ def main():
                     prefill_step_size=PREFILL_STEP,
                 )
                 _kvc_save_ids, _kvc_snap = None, None
-                _prefill_n = 0
-                _prefill_t0 = None
-                _prefill_t1_ref = [None]  # KV Manager/従来経路の prefill 終了時刻
                 if KVC:
                     # 会話履歴部分の KV を再利用し、毎ターンの全履歴再プレフィルを回避する。
                     # 失敗時は従来経路にフォールバック（会話は止めない）。
