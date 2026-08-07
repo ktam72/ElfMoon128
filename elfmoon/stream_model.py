@@ -530,25 +530,41 @@ class StreamingMoE(nn.Module):
     def __call__(self, x):
         shp = x.shape
         xf = x.reshape(-1, shp[-1])
-        logits = self.gate(xf)
-        if self.activation == "sigmoid":
-            # glm4_moe 参照実装に合わせ float32 で sigmoid（精度パリティ確保）
-            probs = mx.sigmoid(logits.astype(mx.float32))
-        elif self.activation == "sqrtsoftplus":
-            probs = mx.sqrt(mx.log1p(mx.exp(-mx.abs(logits))) + mx.maximum(logits, 0))
+        _g = self.gate(xf)
+        if isinstance(_g, tuple) and len(_g) == 2:
+            # 複合ルーター（bailing_hybrid 等）: group_expert_select が
+            # (indices, weights) のタプルを返す。既に top-k 選択済みのため
+            # そのまま idx/w として利用する（汎用対応・特定モデル特化ではない）。
+            idx, w = _g
+            # top_k との整合: 返却された indices の末尾次元を top_k に揃える
+            sel_top_k = idx.shape[-1]
+            eff_k = min(self.top_k, sel_top_k)
+            idx = idx[..., :eff_k]
+            w = w[..., :eff_k]
         else:
-            probs = mx.softmax(logits, axis=-1)
-        # 選択(top-k)には補正バイアス込みのスコアを使うが、重みには補正前の
-        # probs を使う（DeepSeek/Kimi式 aux-loss-free ルーティングの規約）。
-        sel_probs = (
-            probs + self.correction_bias if self.correction_bias is not None else probs
-        )
-        idx = mx.argpartition(-sel_probs, self.top_k - 1, axis=-1)[:, : self.top_k]
-        w = mx.take_along_axis(probs, idx, axis=-1)
-        if self.norm:
-            w = w / mx.sum(w, axis=-1, keepdims=True)
-        if self.routing_scale != 1.0:
-            w = w * self.routing_scale
+            logits = _g
+            if self.activation == "sigmoid":
+                # glm4_moe 参照実装に合わせ float32 で sigmoid（精度パリティ確保）
+                probs = mx.sigmoid(logits.astype(mx.float32))
+            elif self.activation == "sqrtsoftplus":
+                probs = mx.sqrt(
+                    mx.log1p(mx.exp(-mx.abs(logits))) + mx.maximum(logits, 0)
+                )
+            else:
+                probs = mx.softmax(logits, axis=-1)
+            # 選択(top-k)には補正バイアス込みのスコアを使うが、重みには補正前の
+            # probs を使う（DeepSeek/Kimi式 aux-loss-free ルーティングの規約）。
+            sel_probs = (
+                probs + self.correction_bias
+                if self.correction_bias is not None
+                else probs
+            )
+            idx = mx.argpartition(-sel_probs, self.top_k - 1, axis=-1)[:, : self.top_k]
+            w = mx.take_along_axis(probs, idx, axis=-1)
+            if self.norm:
+                w = w / mx.sum(w, axis=-1, keepdims=True)
+            if self.routing_scale != 1.0:
+                w = w * self.routing_scale
         N = xf.shape[0]
 
         def load(e):
@@ -966,9 +982,7 @@ class StreamingSwitchGLU(nn.Module):
     (x[..., D], indices[..., k]) -> [..., k, D]（重み付け・総和は呼び出し側）。
     """
 
-    def __init__(
-        self, layer_idx, store, cache, activation, group_size, bits, mode
-    ):
+    def __init__(self, layer_idx, store, cache, activation, group_size, bits, mode):
         super().__init__()
         self.layer_idx = layer_idx
         self._store = store
@@ -1041,7 +1055,6 @@ def wire_streaming(
     top_k=None の場合、config.json の num_experts_per_tok を自動検出。
     perf=True の場合、常駐率を上げる（明示容量時は最低 8000 に引き上げ）。
     store_dir/model_path 未指定時はモジュール既定（resolve_model()の結果）を使う。
-    model_type が "deepseek_v4" の場合は V4 専用パスを使用。
     """
     _auto_cap = capacity is None
     if model_type is None and model_path is not None:
@@ -1050,15 +1063,6 @@ def wire_streaming(
             model_type = cfg.get("model_type")
         except Exception:
             pass
-    if model_type == "deepseek_v4":
-        return _wire_deepseek_v4(
-            model,
-            capacity,
-            top_k=top_k,
-            perf=perf,
-            store_dir=store_dir,
-            model_path=model_path,
-        )
     if top_k is None:
         top_k = _read_top_k(model_path)
     # ELFMOON_TOP_K: 推論時 top_k 削減（opt-in 高速化・実測 80B top_k=4 で ~1.6x）。
@@ -1115,7 +1119,11 @@ def wire_streaming(
         getattr(model, "layers", None)
         or getattr(model.model, "layers", None)
         or getattr(getattr(model, "language_model", None), "layers", None)
-        or getattr(getattr(getattr(model, "language_model", None), "model", None), "layers", None)
+        or getattr(
+            getattr(getattr(model, "language_model", None), "model", None),
+            "layers",
+            None,
+        )
     )
     n_dense = 0
     last_moe = None
@@ -1254,80 +1262,3 @@ def wire_streaming(
 
     atexit.register(_save_hotset)
     return cache, store
-
-
-def _wire_deepseek_v4(
-    model, capacity, top_k=None, perf=False, store_dir=None, model_path=None
-):
-    if top_k is None:
-        top_k = 6
-    activation = "sqrtsoftplus"
-    routing_scale = 1.5
-    store = ExpertStore(store_dir or STORE_DIR)
-    cache = _make_cache(capacity, perf)
-    layers = getattr(model, "layers", None)
-    if layers is None:
-        layers = getattr(model, "model", model).layers
-    n_moe = 0
-    for l, layer in enumerate(layers):
-        moe = StreamingMoE(
-            l,
-            layer.gate,
-            256,
-            top_k,
-            store,
-            cache,
-            shared_exp=None,
-            shared_gate=None,
-            activation=activation,
-            correction_bias=None,
-            routing_scale=routing_scale,
-            group_size=32,
-            mode="mxfp4",
-        )
-        layer.set_streaming_moe(moe)
-        n_moe += 1
-    mx.clear_cache()
-    autotune_capacity(
-        cache, store, model_path or MODEL_PATH, capacity is None, perf, model
-    )
-    return cache, store
-
-
-# ---- CLI ----
-
-if __name__ == "__main__":
-    import sys
-
-    from mlx_lm import generate, load
-
-    cap = int(sys.argv[1]) if len(sys.argv) > 1 else 6144
-    perf = "--perf" in sys.argv
-    mode = "性能" if perf else "省メモリ"
-    print(f"常駐容量={cap} experts（{mode}モード）")
-    model, tok = load(MODEL_PATH, lazy=True)
-    print("元モデル ロード完了（lazy）。ストリーミング化中...")
-    cache, store = wire_streaming(model, cap, perf=perf)
-    print(f"差し替え完了。常駐メモリ={mx.get_active_memory() / 1e9:.2f}GB")
-
-    plen = sys.argv[2] if len(sys.argv) > 2 else "short"
-    if plen == "long":
-        ctx = "\n".join(
-            f"func f{i}(_ x: Int) -> Int {{ return x * {i} + {i * i} }}"
-            for i in range(40)
-        )
-        prompt = (
-            ctx + "\n// 上記を踏まえ、Swiftで最大公約数gcd(_:_:)を書いて。コードのみ。"
-        )
-    else:
-        prompt = "Write a Swift function gcd(_ a: Int, _ b: Int) -> Int. Code only."
-    t = time.perf_counter()
-    out = generate(model, tok, prompt=prompt, max_tokens=80, verbose=True)
-    dt = time.perf_counter() - t
-    print("=== 生成 ===")
-    print(out)
-    s = cache.stats()
-    print(
-        f"命中率={s['hit_rate'] * 100:.1f}% (hit={s['hits']} miss={s['misses']} 常駐={s['resident']})"
-    )
-    print(f"時間={dt:.1f}s")

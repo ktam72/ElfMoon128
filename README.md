@@ -42,21 +42,6 @@ python3 elfmoon/integrate.py split_all $ELFMOON_MODELS_ROOT128/glm-4.7-4bit
 python3 elfmoon/chat.py --model glm-4.7-4bit
 ```
 
-#### DeepSeek-V4-Flash-0731（公式・変換が必要）
-
-公式 fp8/fp4（167GB）を `convert_v4.py` で MLX 4bit に変換してから使う。
-
-```bash
-HF_HUB_DISABLE_XET=1 hf download deepseek-ai/DeepSeek-V4-Flash-0731 \
-  --local-dir $ELFMOON_MODELS_ROOT128/deepseek-v4-flash-0731
-python3 elfmoon/convert_v4.py \
-  --src $ELFMOON_MODELS_ROOT128/deepseek-v4-flash-0731 \
-  --dst $ELFMOON_MODELS_ROOT128/deepseek-v4-flash-0731-mlx
-python3 elfmoon/chat.py --model deepseek-v4-flash-0731-mlx
-```
-
-> 変換後は公式 167GB + 変換済み ~160GB の約 2 倍のディスクが必要。詳細は [`evidence/elfmoon128/deepseek-v4-flash-0731-technical.md`](evidence/elfmoon128/deepseek-v4-flash-0731-technical.md)。
-
 #### 上級者向け（前提作業あり・詳細は evidence 参照）
 
 | モデル | 対応方法 | 詳細 |
@@ -82,7 +67,6 @@ python3 elfmoon/chat.py --model deepseek-v4-flash-0731-mlx
 |---|---|---|---|---|
 | **[Qwen3-235B-A22B-Instruct-2507](https://huggingface.co/mlx-community/Qwen3-235B-A22B-Instruct-2507-4bit)**（最推奨） | 123 GB | 82% | **11.0** | 命中率100%到達。品質・速度の最良バランス |
 | **[GLM-4.7](https://huggingface.co/mlx-community/GLM-4.7-4bit)** | 185 GB | 54% | **6.7** | 命中率93% |
-| **[DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731)（公式）** | 167 GB | 自動（~66GB） | **4.1〜4.9** | 独自変換 + 専用実装。実用上限 ~4-5 t/s |
 | Kimi K3 非刈込（デモ） | 761 GB | 4.7% | 1.1 | 実用速度ではない（SSD I/O 律速） |
 | Laguna S-2.1（オンメモリ） | 62 GB | — | 63〜69 | 108GiB 内に収まるため分解不要 |
 
