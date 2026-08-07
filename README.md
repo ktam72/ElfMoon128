@@ -152,3 +152,32 @@ ElfMoon128 固有の差分は「常駐容量が既定で自動導出（`capacity
 
 Apache License 2.0。モデル本体のライセンスは配布元のモデルカードに従うこと。
 着想元・基盤は [ElfMoon4 のクレジット](../ElfMoon4/README.md#クレジット)と同じ（[antirez/ds4](https://github.com/antirez/ds4) / [MLX](https://github.com/ml-explore/mlx) / [mlx-lm](https://github.com/ml-explore/mlx-lm)）。
+
+---
+
+## 付録: 調査結果（2026-08-08・M5 Max 128GB 実測）
+
+2026-08-08 時点の M5 Max 128GB 機での調査結果。速度は `elfmoon/bench_models.py`（両経路とも temp=0.0 / top_p=0.95 / top_k=20、warmup 後 2 回計測平均、6 コーディングタスク）、品質は `elfmoon/test/coding_eval_models.py`（関数名・構造を明示した 6 タスクをそのまま実行して厳密比較）による。
+
+### 速度ベンチ（`evidence/bench_all_models.md`）
+
+| モデル | server (tok/s) | chat (tok/s) |
+|---|---|---|
+| [Ling-3.0-flash-MLX-4bit](https://huggingface.co/mlx-community/Ling-3.0-flash-MLX-4bit) | 25.5 | 32.3 |
+| [laguna-s-2.1-4bit](https://huggingface.co/mlx-community/laguna-s-2.1-4bit) | 82.8 | 58.1 |
+| [qwen3-235b-a22b-instruct-4bit](https://huggingface.co/mlx-community/Qwen3-235B-A22B-Instruct-2507-4bit) | 9.8 | 8.7 |
+
+- `server` は api_server（HTTP / OpenAI 互換）、`chat` は chat.py（pty 駆動・1 プロセス = 1 プロンプト）
+- 測定区間は「最初の出力トークン以降の全トークン」基準（学術的定義 vLLM/LMDeploy 準拠、think 含む）
+- qwen3-235b は 123GB モデルでデコードが帯域律速（実用上限 ~4-5 t/s の 4bit 部分常駐設計）
+
+### 品質チェック（`evidence/coding_eval_models.md`・2026-08-07）
+
+| モデル | タイプ | fizzbuzz | quicksort | bank_account | palindrome | bugfix | prime_check | 平均 (tok/s) |
+|---|---|---|---|---|---|---|---|---|
+| laguna-s-2.1-4bit | オンメモリ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 42.5 |
+| qwen3-235b-a22b-instruct-4bit | ストリーミング MoE | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 2.9 |
+| Ling-3.0-flash-MLX-4bit | ストリーミング MoE | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | 20.7 |
+
+- Ling-3.0-flash bugfix FAIL: `total = 0ulp`（4bit 量子化ノイズによる構文破壊・既知の特性）
+- qwen3-235b の品質は 128GB 機でフルロード再評価がメモリ枯渇で不可のため、2026-08-07 の記録を維持

@@ -1,10 +1,9 @@
-"""ElfMoon4 全モデル速度ベンチ（M5 Max 実測 → M4 Pro 推定）
+"""ElfMoon4 全モデル速度ベンチ（M5 Max 実測）
 
 - 文言: evidence/bench_prompts.txt（ElfMoonCoder coding_eval 由来 6 タスク）
 - 経路1: api_server（HTTP / OpenAI 互換）
 - 経路2: chat.py（CLI を pty 駆動、同一エンジン）
 - 出力: evidence/bench_all_models.md + 標準出力に表
-- M4 Pro 推定値 = M5 Max 実測値 ÷ 1.8（帯域比 2.25 の 0.8 掛け＝実効向上率を反映）
 
 usage:
   python3 elfmoon/bench_models.py                 # 全モデル（--list と同一）
@@ -32,8 +31,6 @@ ROOT = HERE.parent
 PROMPTS_FILE = ROOT / "evidence" / "bench_prompts.txt"
 OUTPUT_FILE = ROOT / "evidence" / "bench_all_models.md"
 PORT_BASE = 11440
-# M4 Pro 推定 = M5 Max 実測 ÷ 1.8（帯域比 2.25 の 0.8 掛け＝実効向上率を反映）
-BANDWIDTH_RATIO = 1.8
 MAX_TOKENS = 150
 WARMUP_TOKENS = 30
 TIMEOUT = 900
@@ -452,40 +449,35 @@ def main():
         finally:
             if ctx:
                 ctx.__exit__(None, None, None)
-        est_c = c_tps / BANDWIDTH_RATIO if c_tps else None
-        est_s = s_tps / BANDWIDTH_RATIO if s_tps else None
+        est_c = None
+        est_s = None
         rows.append((m, s_tps, c_tps, est_s, est_c, s_note, c_note))
         s_str = f"{s_tps:.1f}" if s_tps else "—"
         c_str = f"{c_tps:.1f}" if c_tps else "—"
-        es_str = f"{est_s:.1f}" if est_s else "—"
-        ec_str = f"{est_c:.1f}" if est_c else "—"
-        print(f"  → server {s_str}（M4P {es_str}）/ chat {c_str}（M4P {ec_str}）")
+        print(f"  → server {s_str} / chat {c_str}")
         if not s_tps:
             print(f"    server 失敗: {s_note}")
         if not c_tps:
             print(f"    chat 失敗: {c_note}")
 
     lines = [
-        "# ElfMoon4 全モデル速度ベンチ（M5 Max 実測 → M4 Pro 推定）",
+        "# ElfMoon4 全モデル速度ベンチ（M5 Max 実測）",
         "",
-        f"- 実施日: 2026-08-07 / ハードウェア: M5 Max 128GB",
+        f"- 実施日: {time.strftime('%Y-%m-%d')} / ハードウェア: M5 Max 128GB",
         f"- 文言: evidence/bench_prompts.txt（ElfMoonCoder coding_eval 由来 6 タスク）",
-        f"- 経路: api_server（HTTP）・chat.py（pty）、temp=0.0、max_tokens={MAX_TOKENS}、2回計測平均",
-        f"- M4 Pro 推定 = M5 Max 実測 ÷ {BANDWIDTH_RATIO}（帯域比 2.25 の 0.8 掛け＝実効向上率）",
+        f"- 経路: api_server（HTTP）・chat.py（pty、1 プロセス = 1 プロンプト）、temp=0.0/top_p=0.95/top_k=20、max_tokens={MAX_TOKENS}、warmup 後 2 回計測平均",
         "",
-        "| モデル | M5 Max server (tok/s) | M5 Max chat (tok/s) | M4 Pro 推定 server (tok/s) | M4 Pro 推定 chat (tok/s) | 備考 |",
-        "|---|---|---|---|---|---|",
+        "| モデル | M5 Max server (tok/s) | M5 Max chat (tok/s) | 備考 |",
+        "|---|---|---|---|",
     ]
-    for m, s_tps, c_tps, est_s, est_c, s_note, c_note in rows:
+    for m, s_tps, c_tps, _est_s, _est_c, s_note, c_note in rows:
         s_str = f"{s_tps:.1f}" if s_tps else "—"
         c_str = f"{c_tps:.1f}" if c_tps else "—"
-        es_str = f"{est_s:.1f}" if est_s else "—"
-        ec_str = f"{est_c:.1f}" if est_c else "—"
         note = s_note if s_tps else f"server: {s_note}"
         note += f"; chat: {c_note}" if (not c_tps and s_tps) else ""
         if m in args.store_rename:
             note = ("オンメモリ計測; " + note) if note else "オンメモリ計測"
-        lines.append(f"| {m} | {s_str} | {c_str} | {es_str} | {ec_str} | {note} |")
+        lines.append(f"| {m} | {s_str} | {c_str} | {note} |")
     lines.append("")
     OUTPUT_FILE.write_text("\n".join(lines))
     print(f"\n保存: {OUTPUT_FILE}")
