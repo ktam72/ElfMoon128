@@ -1,0 +1,27 @@
+### fizzbuzz
+FizzBuzzをPythonで実装してください。1から100までを標準出力に出力してください。3の倍数でFizz、5の倍数でBuzz、15の倍数でFizzBuzzを出力します。関数名は fizzbuzz、引数なし、戻り値なしです。コードのみ。
+
+### quicksort
+クイックソートをPythonで実装してください。関数名は quicksort、リストを受け取りソート済みリストを返す関数です。コードのみ。
+
+### bank_account
+銀行口座クラスをPythonで実装してください。クラス名は BankAccount、コンストラクタは引数なしで残高0から始まります。入金 deposit(amount)、出金 withdraw(amount)、残高確認 balance() のメソッドを持ちます。balance() はメソッドで残高を返します。コードのみ。
+
+### palindrome
+回文チェック関数をPythonで実装してください。関数名は is_palindrome、文字列を受け取り回文ならTrue、そうでなければFalseを返します。コードのみ。
+
+### bugfix
+以下のPythonコードのバグを修正してください。修正後は print(sum_list([1,2,3])) が 6 を出力するようにしてください。
+
+def sum_list(nums):
+    total = 0
+    for i in nums:
+        total = total + i
+    return total
+
+print(sum_list([1,2,3]))  # 期待: 6
+
+コードのみ。実行可能な完全なコードを出力してください。
+
+### prime_check
+素数判定関数をPythonで実装してください。関数名は is_prime、整数 n を受け取り、n が素数なら True、そうでなければ False を返します。1 は素数ではありません。コードのみ。

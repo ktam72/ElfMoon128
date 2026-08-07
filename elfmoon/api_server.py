@@ -39,7 +39,7 @@ import re
 import sys
 import time
 import uuid
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from queue import Queue
 from socketserver import ThreadingMixIn
 from threading import Thread, Event as ThreadEvent
@@ -54,7 +54,11 @@ from mlx_lm import load as _mlx_load
 from mlx_lm.utils import load_model
 from mlx_lm.generate import generate_step
 from mlx_lm.models.cache import make_prompt_cache
-from mlx_lm.sample_utils import make_sampler
+from mlx_lm.sample_utils import (
+    make_frequency_penalty,
+    make_presence_penalty,
+    make_sampler,
+)
 from stream_model import MODELS_ROOT, list_models, resolve_model, wire_streaming
 
 HOST = os.environ.get("ELFMOON_HOST", "127.0.0.1")
@@ -395,13 +399,29 @@ class GenerationEngine:
         temperature: float = TEMP,
         no_think: bool = False,
         tools: list | None = None,
+        stop=None,
+        seed=None,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
     ):
         cancel = ThreadEvent()
         q: Queue = Queue()
         self._queue.put(
-            ("messages", q, cancel, messages, max_tokens, temperature, no_think, tools)
+            (
+                "messages",
+                q,
+                cancel,
+                messages,
+                max_tokens,
+                temperature,
+                no_think,
+                tools,
+                stop,
+                seed,
+                frequency_penalty,
+                presence_penalty,
+            )
         )
-        prompt_tokens = None
         try:
             while True:
                 msg = q.get()
@@ -410,7 +430,7 @@ class GenerationEngine:
                 if isinstance(msg, Exception):
                     raise msg
                 if isinstance(msg, int):
-                    prompt_tokens = msg
+                    yield msg
                     continue
                 yield msg
                 if cancel.is_set():
@@ -426,6 +446,10 @@ class GenerationEngine:
         max_tokens: int,
         temperature: float,
         no_think: bool,
+        stop=None,
+        seed=None,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
     ):
         cancel = ThreadEvent()
         q: Queue = Queue()
@@ -439,9 +463,12 @@ class GenerationEngine:
                 max_tokens,
                 temperature,
                 no_think,
+                stop,
+                seed,
+                frequency_penalty,
+                presence_penalty,
             )
         )
-        prompt_tokens = None
         try:
             while True:
                 msg = q.get()
@@ -450,7 +477,7 @@ class GenerationEngine:
                 if isinstance(msg, Exception):
                     raise msg
                 if isinstance(msg, int):
-                    prompt_tokens = msg
+                    yield msg
                     continue
                 yield msg
                 if cancel.is_set():
@@ -471,6 +498,19 @@ class GenerationEngine:
             kwargs["top_p"] = 0.95
             kwargs["min_p"] = 0.01
         return kwargs
+
+    def _eos_ids(self):
+        """EOS トークン ID を集合として返す。
+
+        一部のトークナイザーは eos_token_ids が int（単一）を返すため、
+        `token in eos_ids` を安全に使えるよう常に set に正規化する。
+        """
+        raw = getattr(self._tokenizer, "eos_token_ids", None)
+        if raw is None:
+            raw = [self._tokenizer.eos_token_id]
+        elif not isinstance(raw, (list, tuple, set)):
+            raw = [raw]
+        return set(raw)
 
     # ---- 以下、generation スレッド ---- #
 
@@ -494,15 +534,22 @@ class GenerationEngine:
                     temperature,
                     no_think,
                     tools,
+                    stop,
+                    seed,
+                    frequency_penalty,
+                    presence_penalty,
                 ) = item
-                if self._model_type == "deepseek_v4":
-                    gen = self._generate_v4_impl(
-                        messages, max_tokens, temperature, no_think, tools
-                    )
-                else:
-                    gen = self._generate_impl(
-                        messages, max_tokens, temperature, no_think, tools
-                    )
+                gen = self._generate_impl(
+                    messages,
+                    max_tokens,
+                    temperature,
+                    no_think,
+                    tools,
+                    stop,
+                    seed,
+                    frequency_penalty,
+                    presence_penalty,
+                )
             elif req_type == "prompt":
                 (
                     _dummy,
@@ -513,9 +560,21 @@ class GenerationEngine:
                     max_tokens,
                     temperature,
                     no_think,
+                    stop,
+                    seed,
+                    frequency_penalty,
+                    presence_penalty,
                 ) = item
                 gen = self._generate_legacy(
-                    prompt, prompt_nogen, max_tokens, temperature, no_think
+                    prompt,
+                    prompt_nogen,
+                    max_tokens,
+                    temperature,
+                    no_think,
+                    stop,
+                    seed,
+                    frequency_penalty,
+                    presence_penalty,
                 )
             else:
                 continue
@@ -544,22 +603,7 @@ class GenerationEngine:
         self._model_type = model_type
         self._model_name = mp.name.lower()
 
-        if model_type == "deepseek_v4":
-            from model_v4 import DeepseekV4Model
-            from stream_model import _wire_deepseek_v4
-
-            self._model = DeepseekV4Model(str(mp), fused_quant=True)
-            self._moe_cache, _ = _wire_deepseek_v4(
-                self._model,
-                self._cap,
-                top_k=6,
-                store_dir=self._store_dir,
-                model_path=str(mp),
-            )
-            from transformers import AutoTokenizer
-
-            self._tokenizer = AutoTokenizer.from_pretrained(str(mp))
-        elif model_type == "laguna" or "laguna" in mp.name.lower():
+        if model_type == "laguna" or "laguna" in mp.name.lower():
             from laguna_opt import Model as OptimizedLagunaModel, ModelArgs
 
             def _get_laguna_classes(config):
@@ -584,6 +628,7 @@ class GenerationEngine:
             except Exception:
                 from transformers import PreTrainedTokenizerFast
                 from tokenizers import Tokenizer
+                from mlx_lm.tokenizer_utils import TokenizerWrapper
 
                 tk = Tokenizer.from_file(str(mp / "tokenizer.json"))
                 self._tokenizer = PreTrainedTokenizerFast(tokenizer_object=tk)
@@ -595,6 +640,9 @@ class GenerationEngine:
                 eos_ids = _eos_cfg.get("eos_token_id", [])
                 if isinstance(eos_ids, list) and eos_ids:
                     self._tokenizer.eos_token_id = eos_ids[0]
+                self._tokenizer = TokenizerWrapper(
+                    self._tokenizer, eos_token_ids=eos_ids
+                )
         else:
             from mlx_lm.utils import load_model as _lm_load
 
@@ -612,6 +660,7 @@ class GenerationEngine:
             except Exception:
                 from transformers import PreTrainedTokenizerFast
                 from tokenizers import Tokenizer
+                from mlx_lm.tokenizer_utils import TokenizerWrapper
 
                 tk = Tokenizer.from_file(str(mp / "tokenizer.json"))
                 self._tokenizer = PreTrainedTokenizerFast(tokenizer_object=tk)
@@ -623,6 +672,9 @@ class GenerationEngine:
                 eos_ids = _eos_cfg.get("eos_token_id", [])
                 if isinstance(eos_ids, list) and eos_ids:
                     self._tokenizer.eos_token_id = eos_ids[0]
+                self._tokenizer = TokenizerWrapper(
+                    self._tokenizer, eos_token_ids=eos_ids
+                )
             if model_type != "gemma4" and os.path.isdir(os.path.join(str(mp), "store")):
                 self._moe_cache, _ = wire_streaming(
                     self._model,
@@ -634,15 +686,41 @@ class GenerationEngine:
             else:
                 pass  # mx.compile は現在の環境で遅くなるためスキップ
 
-def _generate_legacy(self, prompt, prompt_nogen, max_tokens, temperature, no_think):
+    def _generate_legacy(
+        self,
+        prompt,
+        prompt_nogen,
+        max_tokens,
+        temperature,
+        no_think,
+        stop=None,
+        seed=None,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+    ):
         """従来の高速パス: KV Cache 永続化 + 境界スナップショット対応。"""
         tokenizer = self._tokenizer
         model = self._model
+
+        if seed is not None:
+            mx.random.seed(seed)
+        if stop is None:
+            stop_list = []
+        elif isinstance(stop, str):
+            stop_list = [stop]
+        else:
+            stop_list = [s for s in stop if s]
+        procs = []
+        if frequency_penalty:
+            procs.append(make_frequency_penalty(frequency_penalty, 64))
+        if presence_penalty:
+            procs.append(make_presence_penalty(presence_penalty, 64))
 
         prompt_ids = tokenizer.encode(prompt)
         prompt_tokens = len(prompt_ids)
         # 動的プリフィル調整: 最終チャンクが小さくなりすぎないよう PREFILL_STEP を調整
         from stream_model import optimal_prefill_step
+
         PREFILL_STEP = optimal_prefill_step(prompt_tokens)
         yield prompt_tokens
 
@@ -662,7 +740,7 @@ def _generate_legacy(self, prompt, prompt_nogen, max_tokens, temperature, no_thi
         sampler = make_sampler(**self._sampler_kwargs(temperature))
         detokenizer = tokenizer.detokenizer
         detokenizer.reset()
-        eos_ids = getattr(tokenizer, "eos_token_ids", None) or {tokenizer.eos_token_id}
+        eos_ids = self._eos_ids()
         stripper = ThinkStripper() if no_think else None
 
         cached_cache, cached_len = kv_manager.lookup(prompt_ids, model)
@@ -710,18 +788,37 @@ def _generate_legacy(self, prompt, prompt_nogen, max_tokens, temperature, no_thi
             model,
             max_tokens=max_tokens,
             sampler=sampler,
+            logits_processors=procs or None,
             prompt_cache=prompt_cache,
             prefill_step_size=PREFILL_STEP,
         )
         n = 0
+        _sent = 0
         try:
             for token, _logprob in generator:
                 if token in eos_ids:
                     break
                 detokenizer.add_token(token)
+                if stop_list:
+                    full = detokenizer.text
+                    cut = len(full)
+                    for s in stop_list:
+                        i = full.find(s)
+                        if i != -1 and i < cut:
+                            cut = i
+                    if cut < len(full):
+                        if cut > _sent:
+                            piece = full[_sent:cut]
+                            n += 1
+                            if stripper is not None:
+                                piece = stripper.feed(piece)
+                                if piece is not None:
+                                    yield (piece, n)
+                        break
                 piece = detokenizer.last_segment
                 if not piece:
                     continue
+                _sent = len(detokenizer.text)
                 n += 1
                 if stripper is not None:
                     piece = stripper.feed(piece)
@@ -742,10 +839,35 @@ def _generate_legacy(self, prompt, prompt_nogen, max_tokens, temperature, no_thi
             if save_key_ids is not None:
                 kv_manager.save(save_key_ids, snap)
 
-    def _generate_impl(self, messages, max_tokens, temperature, no_think, tools):
+    def _generate_impl(
+        self,
+        messages,
+        max_tokens,
+        temperature,
+        no_think,
+        tools,
+        stop=None,
+        seed=None,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+    ):
         tokenizer = self._tokenizer
         model = self._model
-        eos_ids = getattr(tokenizer, "eos_token_ids", None) or {tokenizer.eos_token_id}
+        eos_ids = self._eos_ids()
+
+        if seed is not None:
+            mx.random.seed(seed)
+        if stop is None:
+            stop_list = []
+        elif isinstance(stop, str):
+            stop_list = [stop]
+        else:
+            stop_list = [s for s in stop if s]
+        procs = []
+        if frequency_penalty:
+            procs.append(make_frequency_penalty(frequency_penalty, 64))
+        if presence_penalty:
+            procs.append(make_presence_penalty(presence_penalty, 64))
 
         if tools:
             messages = list(messages)
@@ -781,6 +903,7 @@ def _generate_legacy(self, prompt, prompt_nogen, max_tokens, temperature, no_thi
                 yielded_prompt_tokens = True
                 # 動的プリフィル調整（1回目のみ）: 最終チャンクが小さくなりすぎないよう調整
                 from stream_model import optimal_prefill_step
+
                 PREFILL_STEP = optimal_prefill_step(len(prompt_ids))
                 print(
                     f"[ENGINE] prompt={len(prompt_ids)}tok max_tokens={max_tokens} temp={temperature} tools={bool(tools)}",
@@ -801,6 +924,7 @@ def _generate_legacy(self, prompt, prompt_nogen, max_tokens, temperature, no_thi
                 model,
                 max_tokens=max_tokens,
                 sampler=sampler,
+                logits_processors=procs or None,
                 prompt_cache=prompt_cache,
             )
             output_ids = []
@@ -841,6 +965,13 @@ def _generate_legacy(self, prompt, prompt_nogen, max_tokens, temperature, no_thi
                 # detokenizer を逐次に流すとチャンネルマーカーや token artifact が
                 # 除去されず漏れる（これが <|channel>thought<channel|> 漏れの原因）。
                 text_out = _strip_channels(output_text)
+                if stop_list:
+                    cut = len(text_out)
+                    for s in stop_list:
+                        i = text_out.find(s)
+                        if i != -1 and i < cut:
+                            cut = i
+                    text_out = text_out[:cut]
                 if no_think:
                     stripper = ThinkStripper()
                     out = stripper.feed(text_out)
@@ -857,55 +988,6 @@ def _generate_legacy(self, prompt, prompt_nogen, max_tokens, temperature, no_thi
                 "content": _strip_channels(clean_text or "") or None,
             }
             return
-
-    def _generate_v4_impl(self, messages, max_tokens, temperature, no_think, tools):
-        """DeepSeek-V4 専用生成: encode_messages + model.generate (非ストリーミング)。"""
-        from encoding_dsv4 import encode_messages
-
-        tokenizer = self._tokenizer
-        model = self._model
-
-        thinking_mode = "chat" if no_think else "thinking"
-        prompt = encode_messages(messages, thinking_mode=thinking_mode)
-        prompt_ids = tokenizer.encode(prompt)
-        prompt_tokens = len(prompt_ids)
-
-        yield prompt_tokens
-
-        ids_arr = mx.array(prompt_ids, dtype=mx.int64)
-        out_ids = model.generate(
-            ids_arr, max_new=max_tokens, temperature=temperature, top_p=0.9
-        )
-        out_list = out_ids.tolist() if hasattr(out_ids, "tolist") else list(out_ids)
-        new_ids = out_list[prompt_tokens:]
-
-        if not new_ids:
-            return
-
-        if tools:
-            output_text = tokenizer.decode(new_ids, skip_special_tokens=False)
-            clean_text, tool_calls = _extract_tool_calls(output_text)
-            yield {
-                "tool_calls": tool_calls,
-                "content": _strip_channels(clean_text or "") or None,
-            }
-        else:
-            output_text = tokenizer.decode(new_ids, skip_special_tokens=True)
-            text_out = _strip_channels(output_text)
-            if no_think:
-                stripper = ThinkStripper()
-                out = stripper.feed(text_out)
-                text_out = (out or "") + stripper.pending
-            if text_out:
-                yield (text_out, len(new_ids))
-
-
-# ---- HTTP ----
-
-
-class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
-    allow_reuse_address = True
-    daemon_threads = True
 
 
 engine: GenerationEngine = None
@@ -926,13 +1008,13 @@ class APIHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/v1/models":
             return self._handle_models()
-        self._send_json(404, {"error": "not_found", "message": f"Not found: {path}"})
+        self._send_error(404, f"Not found: {path}", code="not_found")
 
     def do_POST(self):
         path = urlparse(self.path).path
         if path == "/v1/chat/completions":
             return self._handle_chat_completions()
-        self._send_json(404, {"error": "not_found", "message": f"Not found: {path}"})
+        self._send_error(404, f"Not found: {path}", code="not_found")
 
     # ---- handlers ----
 
@@ -966,23 +1048,22 @@ class APIHandler(BaseHTTPRequestHandler):
             flush=True,
         )
         if not messages:
-            return self._send_json(
-                400, {"error": "invalid_request", "message": "messages is required"}
-            )
+            return self._send_error(400, "messages is required", code="invalid_request")
         if req_id != "?" and req_id != MODEL_ID:
-            return self._send_json(
+            return self._send_error(
                 400,
-                {
-                    "error": "model_not_loaded",
-                    "message": (
-                        f"model='{req_id}' はロードされていません。"
-                        f"現在ロード中: {MODEL_ID}。"
-                        f" クライアント設定で model を {MODEL_ID} に修正してください。"
-                    ),
-                },
+                (
+                    f"model='{req_id}' はロードされていません。"
+                    f"現在ロード中: {MODEL_ID}。"
+                    f" クライアント設定で model を {MODEL_ID} に修正してください。"
+                ),
+                code="model_not_loaded",
             )
 
         max_tokens = min(body.get("max_tokens", MAX_TOKENS), MAX_TOKENS)
+        max_completion_tokens = body.get("max_completion_tokens")
+        if max_completion_tokens is not None:
+            max_tokens = min(max_completion_tokens, MAX_TOKENS)
         eng = _get_engine()
         if eng._model_type == "gemma4":
             _def_temp = 1.0
@@ -995,6 +1076,29 @@ class APIHandler(BaseHTTPRequestHandler):
         temperature = body.get("temperature", _def_temp)
         tools = body.get("tools", None)
         tool_choice = body.get("tool_choice", "auto")
+        stop = body.get("stop")
+        seed = body.get("seed")
+        frequency_penalty = body.get("frequency_penalty", 0.0)
+        presence_penalty = body.get("presence_penalty", 0.0)
+        n = body.get("n", 1)
+        include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
+
+        if n != 1:
+            return self._send_error(
+                400, "n は 1 のみサポートされています", param="n", code="unsupported"
+            )
+        # OpenAI スキーマに存在するが未対応のパラメータ（tools/tool_choice は対応済み）
+        for field in (
+            "logprobs",
+            "top_logprobs",
+            "logit_bias",
+            "parallel_tool_calls",
+            "response_format",
+        ):
+            if body.get(field):
+                return self._send_error(
+                    400, f"{field} は未サポートです", param=field, code="unsupported"
+                )
 
         if tools is None:
             mcp_tools = mcp_manager.get_openai_tools()
@@ -1007,15 +1111,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     flush=True,
                 )
 
-        # V4: 常に messages 経路（encode_messages で prompt 構築）
-        if eng._model_type == "deepseek_v4":
-            if stream:
-                self._handle_stream_tools(messages, max_tokens, temperature, tools)
-            else:
-                self._handle_nonstream_tools(messages, max_tokens, temperature, tools)
         # ツールなし → 従来通り API ハンドラ側で prompt レンダリング（高速パス）
         # ツールあり → エンジンに messages + tools を渡してループ処理
-        elif not tools:
+        if not tools:
             try:
                 prompt = self._tokenizer.apply_chat_template(
                     messages,
@@ -1030,27 +1128,57 @@ class APIHandler(BaseHTTPRequestHandler):
                     enable_thinking=not NO_THINK,
                 )
             except Exception as e:
-                return self._send_json(
-                    400,
-                    {
-                        "error": "invalid_request",
-                        "message": f"chat_template error: {e}",
-                    },
+                return self._send_error(
+                    400, f"chat_template error: {e}", code="chat_template_error"
                 )
 
             if stream:
                 self._handle_stream_legacy(
-                    prompt, prompt_nogen, max_tokens, temperature
+                    prompt,
+                    prompt_nogen,
+                    max_tokens,
+                    temperature,
+                    stop,
+                    seed,
+                    frequency_penalty,
+                    presence_penalty,
+                    include_usage,
                 )
             else:
                 self._handle_nonstream_legacy(
-                    prompt, prompt_nogen, max_tokens, temperature
+                    prompt,
+                    prompt_nogen,
+                    max_tokens,
+                    temperature,
+                    stop,
+                    seed,
+                    frequency_penalty,
+                    presence_penalty,
                 )
         else:
             if stream:
-                self._handle_stream_tools(messages, max_tokens, temperature, tools)
+                self._handle_stream_tools(
+                    messages,
+                    max_tokens,
+                    temperature,
+                    tools,
+                    stop,
+                    seed,
+                    frequency_penalty,
+                    presence_penalty,
+                    include_usage,
+                )
             else:
-                self._handle_nonstream_tools(messages, max_tokens, temperature, tools)
+                self._handle_nonstream_tools(
+                    messages,
+                    max_tokens,
+                    temperature,
+                    tools,
+                    stop,
+                    seed,
+                    frequency_penalty,
+                    presence_penalty,
+                )
 
     @property
     def _tokenizer(self):
@@ -1058,7 +1186,18 @@ class APIHandler(BaseHTTPRequestHandler):
 
     # ---- 従来の高速パス（ツールなし） ---- #
 
-    def _handle_stream_legacy(self, prompt, prompt_nogen, max_tokens, temperature):
+    def _handle_stream_legacy(
+        self,
+        prompt,
+        prompt_nogen,
+        max_tokens,
+        temperature,
+        stop=None,
+        seed=None,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+        include_usage=False,
+    ):
         t0 = time.time()
         self.send_response(200)
         self._cors_headers()
@@ -1075,7 +1214,15 @@ class APIHandler(BaseHTTPRequestHandler):
         error = False
 
         gen = _get_engine().generate_prompt(
-            prompt, prompt_nogen, max_tokens, temperature, NO_THINK
+            prompt,
+            prompt_nogen,
+            max_tokens,
+            temperature,
+            NO_THINK,
+            stop,
+            seed,
+            frequency_penalty,
+            presence_penalty,
         )
         try:
             for msg in gen:
@@ -1108,16 +1255,59 @@ class APIHandler(BaseHTTPRequestHandler):
             }
             try:
                 self._sse(json.dumps(err_chunk, ensure_ascii=False))
+                self._sse("[DONE]")
             except OSError:
                 pass
+        else:
+            done_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": MODEL_ID,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+            self._sse(json.dumps(done_chunk, ensure_ascii=False))
+            if include_usage:
+                usage_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": MODEL_ID,
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": total,
+                        "total_tokens": prompt_tokens + total,
+                    },
+                }
+                self._sse(json.dumps(usage_chunk, ensure_ascii=False))
+            self._sse("[DONE]")
 
-    def _handle_nonstream_legacy(self, prompt, prompt_nogen, max_tokens, temperature):
+    def _handle_nonstream_legacy(
+        self,
+        prompt,
+        prompt_nogen,
+        max_tokens,
+        temperature,
+        stop=None,
+        seed=None,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+    ):
         t0 = time.time()
         pieces = []
         total = 0
         prompt_tokens = 0
         gen = _get_engine().generate_prompt(
-            prompt, prompt_nogen, max_tokens, temperature, NO_THINK
+            prompt,
+            prompt_nogen,
+            max_tokens,
+            temperature,
+            NO_THINK,
+            stop,
+            seed,
+            frequency_penalty,
+            presence_penalty,
         )
         try:
             for msg in gen:
@@ -1129,8 +1319,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 total = n
         except Exception as e:
             print(f"[API] generate error: {e}", file=sys.stderr, flush=True)
-            return self._send_json(
-                500, {"error": "generation_error", "message": str(e)}
+            return self._send_error(
+                500, str(e), type="server_error", code="generation_error"
             )
 
         text = "".join(pieces)
@@ -1161,7 +1351,18 @@ class APIHandler(BaseHTTPRequestHandler):
 
     # ---- ツール対応パス ---- #
 
-    def _handle_stream_tools(self, messages, max_tokens, temperature, tools):
+    def _handle_stream_tools(
+        self,
+        messages,
+        max_tokens,
+        temperature,
+        tools,
+        stop=None,
+        seed=None,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+        include_usage=False,
+    ):
         t0 = time.time()
         self.send_response(200)
         self._cors_headers()
@@ -1183,6 +1384,10 @@ class APIHandler(BaseHTTPRequestHandler):
             temperature=temperature,
             no_think=NO_THINK,
             tools=tools,
+            stop=stop,
+            seed=seed,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
         )
         finish_reason = "stop"
         try:
@@ -1282,12 +1487,13 @@ class APIHandler(BaseHTTPRequestHandler):
             "created": created,
             "model": MODEL_ID,
             "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
-            "usage": {
+        }
+        if include_usage:
+            final["usage"] = {
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": total,
                 "total_tokens": prompt_tokens + total,
-            },
-        }
+            }
         try:
             self._sse(json.dumps(final, ensure_ascii=False))
             self._sse("[DONE]")
@@ -1299,7 +1505,17 @@ class APIHandler(BaseHTTPRequestHandler):
             flush=True,
         )
 
-    def _handle_nonstream_tools(self, messages, max_tokens, temperature, tools):
+    def _handle_nonstream_tools(
+        self,
+        messages,
+        max_tokens,
+        temperature,
+        tools,
+        stop=None,
+        seed=None,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+    ):
         t0 = time.time()
         pieces = []
         total = 0
@@ -1310,6 +1526,10 @@ class APIHandler(BaseHTTPRequestHandler):
             temperature=temperature,
             no_think=NO_THINK,
             tools=tools,
+            stop=stop,
+            seed=seed,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
         )
         tool_calls = None
         tc_content = ""
@@ -1327,8 +1547,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 total = n
         except Exception as e:
             print(f"[API] generate error: {e}", file=sys.stderr, flush=True)
-            return self._send_json(
-                500, {"error": "generation_error", "message": str(e)}
+            return self._send_error(
+                500, str(e), type="server_error", code="generation_error"
             )
 
         print(
@@ -1382,6 +1602,19 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_error(
+        self,
+        status,
+        message,
+        type="invalid_request_error",
+        param=None,
+        code="invalid_request_error",
+    ):
+        return self._send_json(
+            status,
+            {"error": {"message": message, "type": type, "param": param, "code": code}},
+        )
 
     def _sse(self, data):
         self.wfile.write(f"data: {data}\n\n".encode())
