@@ -122,6 +122,22 @@ _TC_END = re.escape(TOOL_CALL_END)
 # 末尾 | を任意にした正規表現で許容する（片側欠けによる抽出漏れを防ぐ）。
 _TC_START_RE = re.compile(r"<\|tool_call\|?>")
 
+# セクション形式の tool call マーカー（例: <|tool_call_begin|>{...}<|tool_call_end|>）。
+# セクション開始/終了マーカーは実モデルで <| 始まりと |< 始まりの両形が観測されるため、
+# 正規表現で許容する。
+TOOL_CALL_BEGIN_MARKER = "<|tool_call_begin|>"
+TOOL_CALL_END_MARKER = "<|tool_call_end|>"
+_SECTION_MARKER_RE = re.compile(r"[<|]{1,2}tool_calls_section_(?:begin|end)\|>")
+
+# Laguna 等の tool call 形式（chat_template 準拠）:
+# <tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>
+TOOL_CALL_LEGACY_START = "<tool_call>"
+TOOL_CALL_LEGACY_END = "</tool_call>"
+_ARG_KEY_START = "<arg_key>"
+_ARG_KEY_END = "</arg_key>"
+_ARG_VALUE_START = "<arg_value>"
+_ARG_VALUE_END = "</arg_value>"
+
 
 def _match_brace(text: str, pos: int) -> int:
     """text[pos] が '{' の場合、対応する '}' の位置+1 を返す。"""
@@ -289,8 +305,178 @@ def _strip_channels(text: str) -> str:
     return "".join(result)
 
 
+def _parse_tool_json_body(body: str) -> dict | None:
+    """tool_call ボディの OpenAI JSON 形式 {"name":..., "arguments":...} を dict に変換する。"""
+    json_m = re.match(r"\s*(\{)", body)
+    if not json_m:
+        return None
+    close = _match_brace(body, json_m.start(1))
+    if close <= 0:
+        return None
+    raw = body[json_m.start(1) : close]
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    name = data.get("name") or data.get("function", {}).get("name", "")
+    args = data.get("arguments") or data.get("function", {}).get("arguments", {})
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except json.JSONDecodeError:
+            args = {}
+    return {
+        "id": f"call_{uuid.uuid4().hex[:12]}",
+        "type": "function",
+        "function": {"name": name, "arguments": json.dumps(args)},
+    }
+
+
+def _parse_legacy_tool_body(body: str) -> dict | None:
+    """Laguna 形式のボディ <tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call> を dict に変換する。"""
+    # 関数名は <arg_key> の前までのテキスト（<tool_call> 直後。引数がない場合は全体）
+    key_pos = body.find(_ARG_KEY_START)
+    name_part = body if key_pos == -1 else body[:key_pos]
+    m = re.match(r"\s*([^\s<]+)", name_part)
+    if not m:
+        return None
+    name = m.group(1)
+    rest = body[m.end() :] if key_pos == -1 else body[key_pos:]
+    args = {}
+    while True:
+        ks = rest.find(_ARG_KEY_START)
+        if ks == -1:
+            break
+        ke = rest.find(_ARG_KEY_END, ks)
+        vs = rest.find(_ARG_VALUE_START, ke)
+        if ke == -1 or vs == -1:
+            break
+        ve = rest.find(_ARG_VALUE_END, vs)
+        if ve == -1:
+            break
+        key = rest[ks + len(_ARG_KEY_START) : ke]
+        raw_val = rest[vs + len(_ARG_VALUE_START) : ve]
+        args[key] = _coerce_legacy_value(raw_val)
+        rest = rest[ve + len(_ARG_VALUE_END) :]
+    return {
+        "id": f"call_{uuid.uuid4().hex[:12]}",
+        "type": "function",
+        "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+    }
+
+
+def _coerce_legacy_value(raw: str):
+    """Laguna の arg_value（文字列 or JSON 化された値）を Python 値に変換する。"""
+    s = raw.strip()
+    if s.startswith('"') and s.endswith('"'):
+        try:
+            return json.loads(s)
+        except json.JSONDecodeError:
+            return raw
+    if s == "true":
+        return True
+    if s == "false":
+        return False
+    if s == "null":
+        return None
+    m = re.fullmatch(r"-?\d+", s)
+    if m:
+        return int(s)
+    m = re.fullmatch(r"-?\d+\.\d+", s)
+    if m:
+        return float(s)
+    if s.startswith("{") or s.startswith("["):
+        try:
+            return json.loads(s)
+        except json.JSONDecodeError:
+            return raw
+    return raw
+
+
+def _extract_legacy_tool_calls(text: str) -> tuple[str, list[dict]]:
+    """Laguna 形式（<tool_call>name<arg_key>...</arg_key>...</tool_call>）を抽出する。"""
+    if TOOL_CALL_LEGACY_START not in text:
+        return text, []
+    calls = []
+    cleaned_parts = []
+    i = 0
+    while True:
+        begin = text.find(TOOL_CALL_LEGACY_START, i)
+        if begin == -1:
+            cleaned_parts.append(text[i:])
+            break
+        cleaned_parts.append(text[i:begin])
+        end = text.find(TOOL_CALL_LEGACY_END, begin)
+        if end == -1:
+            cleaned_parts.append(text[begin:])
+            break
+        body = text[begin + len(TOOL_CALL_LEGACY_START) : end]
+        # qwen3 などは <tool_call> 内に JSON オブジェクト {"name":...,"arguments":...} を入れる。
+        # Laguna 形式（<arg_key> タグ）よりも先に JSON 形式を試す。
+        parsed = _parse_tool_json_body(body)
+        if parsed is None:
+            parsed = _parse_legacy_tool_body(body)
+        if parsed is not None:
+            calls.append(parsed)
+            cleaned_parts.append("")
+        else:
+            cleaned_parts.append(text[begin : end + len(TOOL_CALL_LEGACY_END)])
+        i = end + len(TOOL_CALL_LEGACY_END)
+    cleaned = "".join(cleaned_parts).strip()
+    return cleaned, calls
+
+
+def _extract_section_tool_calls(text: str) -> tuple[str, list[dict]]:
+    """セクション形式の tool call（<|tool_call_begin|>...</tool_call|>）を抽出する。
+
+    例:
+      |<tool_calls_section_begin|>\n<|tool_call_begin|>{"name":...,"arguments":...}<|tool_call_end|>
+    gemma 系の <|tool_call|> マーカーは含まないため、_TC_START_RE では拾えない。
+    """
+    if TOOL_CALL_BEGIN_MARKER not in text:
+        return text, []
+    calls = []
+    cleaned_parts = []
+    i = 0
+    while True:
+        begin = text.find(TOOL_CALL_BEGIN_MARKER, i)
+        if begin == -1:
+            cleaned_parts.append(text[i:])
+            break
+        cleaned_parts.append(text[i:begin])
+        content_start = begin + len(TOOL_CALL_BEGIN_MARKER)
+        end = text.find(TOOL_CALL_END_MARKER, content_start)
+        if end == -1:
+            cleaned_parts.append(text[begin:])
+            break
+        body = text[content_start:end].strip()
+        parsed = _parse_tool_json_body(body)
+        if parsed is not None:
+            calls.append(parsed)
+            cleaned_parts.append("")
+        else:
+            cleaned_parts.append(text[begin : end + len(TOOL_CALL_END_MARKER)])
+        i = end + len(TOOL_CALL_END_MARKER)
+    cleaned = "".join(cleaned_parts).strip()
+    # セクションマーカーも除去する
+    cleaned = _SECTION_MARKER_RE.sub("", cleaned).strip()
+    return cleaned, calls
+
+
 def _extract_tool_calls(text: str) -> tuple[str, list[dict]]:
     """テキストから tool_call ブロックを抽出し、(マーカー除去済みテキスト, tool_call リスト) を返す。"""
+    # セクション形式（<|tool_call_begin|>）を優先して処理
+    if TOOL_CALL_BEGIN_MARKER in text:
+        clean, calls = _extract_section_tool_calls(text)
+        # マーカーはあるが解析できなかった場合は通常パスへ委譲せず、
+        # マーカーを除去したテキストを返す（ループ継続での失敗を避ける）
+        return clean, calls
+
+    # Laguna 形式（<tool_call>name<arg_key>...</arg_key>...</tool_call>）
+    if TOOL_CALL_LEGACY_START in text:
+        clean, calls = _extract_legacy_tool_calls(text)
+        return clean, calls
+
     calls = []
     cleaned_parts = []
     i = 0
@@ -371,6 +557,40 @@ def _extract_tool_calls(text: str) -> tuple[str, list[dict]]:
 
     cleaned = "".join(cleaned_parts).strip()
     return cleaned, calls
+
+
+def _normalize_tool_args(messages: list) -> list:
+    """受信メッセージの tool_calls[].function.arguments（OpenAI 標準の JSON 文字列）を
+    dict に変換する。Laguna 等の chat_template は arguments に .items() を回すため、
+    文字列のままだとテンプレート描画が UndefinedError になる。"""
+    out = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            out.append(msg)
+            continue
+        msg = dict(msg)
+        tcs = msg.get("tool_calls")
+        if isinstance(tcs, list):
+            norm = []
+            for tc in tcs:
+                if not isinstance(tc, dict):
+                    norm.append(tc)
+                    continue
+                tc = dict(tc)
+                fn = tc.get("function")
+                if isinstance(fn, dict):
+                    fn = dict(fn)
+                    args = fn.get("arguments")
+                    if isinstance(args, str):
+                        try:
+                            fn["arguments"] = json.loads(args)
+                        except (json.JSONDecodeError, TypeError):
+                            fn["arguments"] = {}
+                    tc["function"] = fn
+                norm.append(tc)
+            msg["tool_calls"] = norm
+        out.append(msg)
+    return out
 
 
 class GenerationEngine:
@@ -1040,6 +1260,7 @@ class APIHandler(BaseHTTPRequestHandler):
             return self._send_json(400, {"error": "invalid_request", "message": str(e)})
 
         messages = body.get("messages", [])
+        messages = _normalize_tool_args(messages)
         req_id = body.get("model", "?")
         stream = body.get("stream", False)
         print(
