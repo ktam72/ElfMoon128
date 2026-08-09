@@ -1,6 +1,9 @@
 """ElfMoon OpenAI 互換 API サーバ（generation-thread 方式）。
 
 POST /v1/chat/completions   (stream/non-stream, OpenAI 互換)
+POST /v1/completions        (OpenAI テキスト補完)
+POST /v1/responses          (OpenAI Responses API)
+POST /v1/messages           (Anthropic 互換)
 GET  /v1/models
 
 これにより Claude Code / VS Code Continue / Cursor / Zed / Open Interpreter 等の
@@ -60,6 +63,7 @@ from mlx_lm.sample_utils import (
     make_sampler,
 )
 from stream_model import MODELS_ROOT, list_models, resolve_model, wire_streaming
+from tool_replay import ToolReplayStore, tool_replay_path
 
 HOST = os.environ.get("ELFMOON_HOST", "127.0.0.1")
 DEFAULT_PORT = 11434
@@ -103,6 +107,64 @@ class ThinkStripper:
             self._buf = ""
             return after if after else None
         return None
+
+    @property
+    def pending(self):
+        return self._buf if self._skip else ""
+
+
+class ReasoningSplitter:
+    """<think>...</think> を reasoning / content に分けてストリームする。
+
+    ThinkStripper が思考を**除去**するのに対し、本クラスは思考を reasoning として
+    分離し、<think> が閉じた後を content として返す。in_think=True（プロンプト末尾
+    が <think>）なら最初から reasoning とみなす。
+
+    feed(piece) は (reasoning_piece, content_piece) を返す。いずれも None の場合あり。
+    ストリーム末尾で pending に未確定分が残る。
+    """
+
+    _THINK_OPEN = "<think>"
+    _THINK_CLOSE = "</think>"
+
+    def __init__(self, in_think=False):
+        self._buf = ""
+        self._skip = True
+        self._peeking = not in_think
+        self._started = in_think
+
+    def feed(self, piece):
+        if not self._skip:
+            return None, piece
+        self._buf += piece
+        if self._peeking:
+            # 開きタグを待つ（部分一致の間は保持）
+            stripped = self._buf.lstrip()
+            if not stripped or self._THINK_OPEN.startswith(stripped):
+                return None, None
+            self._peeking = False
+            if stripped.startswith("<think"):
+                # 開きタグを除去して reasoning モードへ
+                self._buf = stripped[len(self._THINK_OPEN) :]
+            else:
+                self._skip = False
+                out, self._buf = self._buf, ""
+                return None, (out if out else None)
+        # reasoning 中: </think> を探す
+        idx = self._buf.find(self._THINK_CLOSE)
+        if idx >= 0:
+            self._skip = False
+            reasoning = self._buf[:idx]
+            after = self._buf[idx + len(self._THINK_CLOSE) :]
+            self._buf = ""
+            return (reasoning if reasoning else None), (after if after else None)
+        # 確定済み reasoning を送出（末尾 8 文字は </think> の可能性があるため保留）
+        keep = max(0, len(self._buf) - len(self._THINK_CLOSE))
+        if keep > 0:
+            out = self._buf[:keep]
+            self._buf = self._buf[keep:]
+            return out, None
+        return None, None
 
     @property
     def pending(self):
@@ -593,6 +655,175 @@ def _normalize_tool_args(messages: list) -> list:
     return out
 
 
+# ---- reasoning 分割（<think>...</think>） ----
+
+
+def _split_reasoning(text: str) -> tuple[str, str]:
+    """出力テキストを (reasoning, content) に分割する。
+
+    <think> が先頭にある場合: その中のテキストを reasoning に、
+    残りを content にする。閉じタグが無い場合は先頭 <think> 以降を
+    reasoning、content は空（未終了 reasoning）。
+    """
+    if text.startswith("<think>"):
+        end = text.find("</think>")
+        if end != -1:
+            return text[7:end], text[end + 8 :]
+        return text[7:], ""
+    end = text.find("</think>")
+    if end != -1:
+        return text[:end], text[end + 8 :]
+    return "", text
+
+
+def _contains_think(text: str) -> bool:
+    return "<think>" in text or "</think>" in text
+
+
+# ---- tool マーカー検出（ストリーミング用） ----
+
+_TOOL_START_MARKERS = ["<tool_call>", "<|tool_call|>", "<|tool_call>"]
+_TOOL_END_MARKERS = ["</tool_call>", "<tool_call|>", "<tool_call|>"]
+# tool 領域検出のための後ろ倒し文字数。最大マーカー長（<|tool_call|> = 13）より
+# 大きければ安全（Swift の firstToolMarkerOffset の -12 に相当）。
+_TOOL_LOOKAHEAD = 16
+
+
+def _first_tool_marker(text: str) -> int | None:
+    """text 内の最初の tool 開始マーカーの位置（文字インデックス）を返す。無ければ None。"""
+    pos = None
+    for m in _TOOL_START_MARKERS:
+        i = text.find(m)
+        if i != -1 and (pos is None or i < pos):
+            pos = i
+    return pos
+
+
+def _tool_call_complete(text: str) -> bool:
+    """tool_call の閉じマーカーが揃ったかを判定する（Swift toolCallComplete 相当）。"""
+    if TOOL_CALL_LEGACY_START in text and TOOL_CALL_LEGACY_END in text:
+        return True
+    if TOOL_CALL_START in text and TOOL_CALL_END in text:
+        return True
+    return False
+
+
+# ---- content ブロック正規化（OpenAI/Anthropic 形式） ----
+
+
+def _normalize_message(msg: dict) -> dict:
+    """messages[].content が文字列またはブロック配列の場合を正規化する。
+
+    - OpenAI: content が文字列の場合はそのまま
+    - Anthropic 系: content が配列（text / thinking / tool_use / tool_result）
+    - 戻り値: content(str) / reasoning(str) / tool_calls(list) / tool_call_id(str?)
+
+    role:tool（function）は content が文字列 or tool_result ブロック。
+    """
+    role = msg.get("role", "user")
+    content = msg.get("content")
+    reasoning = msg.get("reasoning") or ""
+    tool_calls = msg.get("tool_calls") or []
+    tool_call_id = msg.get("tool_call_id")
+
+    if isinstance(content, str):
+        return {
+            "role": role,
+            "content": content,
+            "reasoning": reasoning,
+            "tool_calls": tool_calls,
+            "tool_call_id": tool_call_id,
+        }
+
+    if not isinstance(content, list):
+        return {
+            "role": role,
+            "content": "",
+            "reasoning": reasoning,
+            "tool_calls": tool_calls,
+            "tool_call_id": tool_call_id,
+        }
+
+    text_parts = []
+    for block in content:
+        if not isinstance(block, dict):
+            text_parts.append(str(block))
+            continue
+        btype = block.get("type", "text")
+        if btype in ("text", "input_text", "output_text"):
+            text_parts.append(block.get("text") or "")
+        elif btype in ("thinking", "reasoning"):
+            reasoning += (
+                block.get("thinking") or block.get("summary") or block.get("text") or ""
+            )
+        elif btype == "tool_use":
+            name = block.get("name") or ""
+            args = block.get("input") or {}
+            cid = block.get("id") or f"call_{uuid.uuid4().hex[:12]}"
+            tool_calls.append(
+                {
+                    "id": cid,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(args, ensure_ascii=False),
+                    },
+                }
+            )
+        elif btype == "tool_result":
+            tool_call_id = block.get("tool_use_id") or tool_call_id
+            result = block.get("content")
+            if isinstance(result, list):
+                result = "".join(
+                    b.get("text", "") if isinstance(b, dict) else str(b) for b in result
+                )
+            text_parts.append(result or "")
+        else:
+            text_parts.append(block.get("text") or "")
+
+    return {
+        "role": role,
+        "content": "".join(text_parts),
+        "reasoning": reasoning,
+        "tool_calls": tool_calls,
+        "tool_call_id": tool_call_id,
+    }
+
+
+def _normalize_messages(messages: list) -> list:
+    """messages 全体を正規化し、tool_calls の arguments を dict 化する。"""
+    out = []
+    for msg in messages:
+        nm = _normalize_message(msg)
+        if nm["tool_calls"]:
+            nm = _normalize_tool_args([nm])[0]
+        out.append(nm)
+    return out
+
+
+def _reasoning_enabled(thinking, think, reasoning_effort) -> bool:
+    """thinking / think / reasoning_effort から reasoning を有効にするか判定する。
+
+    - reasoning_effort == "none"|"minimal" → False
+    - thinking が bool → その値
+    - thinking が {type: "disabled"} → False
+    - think が bool → その値
+    - 既定 → True
+    """
+    if reasoning_effort:
+        if reasoning_effort.lower() in ("none", "minimal"):
+            return False
+    if isinstance(thinking, bool):
+        return thinking
+    if isinstance(thinking, dict):
+        if thinking.get("type") == "disabled":
+            return False
+        return True
+    if think is not None:
+        return bool(think)
+    return True
+
+
 class GenerationEngine:
     """モデルを専用スレッドで保持し、リクエストを直列化して generation する。"""
 
@@ -608,6 +839,8 @@ class GenerationEngine:
         self._tokenizer = None
         self._moe_cache = None
         self._model_type = ""
+        self._model_name = ""
+        self._tool_replay = ToolReplayStore(filepath=tool_replay_path(""))
 
         self._thread.start()
         self._ready.wait()
@@ -623,6 +856,10 @@ class GenerationEngine:
         seed=None,
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        min_p: float | None = None,
+        reasoning_effort: str | None = None,
     ):
         cancel = ThreadEvent()
         q: Queue = Queue()
@@ -640,6 +877,10 @@ class GenerationEngine:
                 seed,
                 frequency_penalty,
                 presence_penalty,
+                top_p,
+                top_k,
+                min_p,
+                reasoning_effort,
             )
         )
         try:
@@ -670,6 +911,9 @@ class GenerationEngine:
         seed=None,
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        min_p: float | None = None,
     ):
         cancel = ThreadEvent()
         q: Queue = Queue()
@@ -687,6 +931,9 @@ class GenerationEngine:
                 seed,
                 frequency_penalty,
                 presence_penalty,
+                top_p,
+                top_k,
+                min_p,
             )
         )
         try:
@@ -706,7 +953,13 @@ class GenerationEngine:
             cancel.set()
             raise
 
-    def _sampler_kwargs(self, temperature: float) -> dict:
+    def _sampler_kwargs(
+        self,
+        temperature: float,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        min_p: float | None = None,
+    ) -> dict:
         kwargs = {"temp": temperature}
         if self._model_type == "gemma4":
             kwargs["top_p"] = 0.95
@@ -717,6 +970,12 @@ class GenerationEngine:
         elif "glm" in self._model_name:
             kwargs["top_p"] = 0.95
             kwargs["min_p"] = 0.01
+        if top_p is not None:
+            kwargs["top_p"] = top_p
+        if top_k is not None:
+            kwargs["top_k"] = top_k
+        if min_p is not None:
+            kwargs["min_p"] = min_p
         return kwargs
 
     def _eos_ids(self):
@@ -758,6 +1017,10 @@ class GenerationEngine:
                     seed,
                     frequency_penalty,
                     presence_penalty,
+                    top_p,
+                    top_k,
+                    min_p,
+                    reasoning_effort,
                 ) = item
                 gen = self._generate_impl(
                     messages,
@@ -769,6 +1032,10 @@ class GenerationEngine:
                     seed,
                     frequency_penalty,
                     presence_penalty,
+                    top_p,
+                    top_k,
+                    min_p,
+                    reasoning_effort,
                 )
             elif req_type == "prompt":
                 (
@@ -784,6 +1051,9 @@ class GenerationEngine:
                     seed,
                     frequency_penalty,
                     presence_penalty,
+                    top_p,
+                    top_k,
+                    min_p,
                 ) = item
                 gen = self._generate_legacy(
                     prompt,
@@ -795,6 +1065,9 @@ class GenerationEngine:
                     seed,
                     frequency_penalty,
                     presence_penalty,
+                    top_p,
+                    top_k,
+                    min_p,
                 )
             else:
                 continue
@@ -822,6 +1095,7 @@ class GenerationEngine:
 
         self._model_type = model_type
         self._model_name = mp.name.lower()
+        self._tool_replay = ToolReplayStore(filepath=tool_replay_path(self._model_name))
 
         if model_type == "laguna" or "laguna" in mp.name.lower():
             from laguna_opt import Model as OptimizedLagunaModel, ModelArgs
@@ -917,6 +1191,9 @@ class GenerationEngine:
         seed=None,
         frequency_penalty=0.0,
         presence_penalty=0.0,
+        top_p=None,
+        top_k=None,
+        min_p=None,
     ):
         """従来の高速パス: KV Cache 永続化 + 境界スナップショット対応。"""
         tokenizer = self._tokenizer
@@ -957,11 +1234,17 @@ class GenerationEngine:
                 break
             boundary = i + 1
 
-        sampler = make_sampler(**self._sampler_kwargs(temperature))
+        sampler = make_sampler(**self._sampler_kwargs(temperature, top_p, top_k, min_p))
         detokenizer = tokenizer.detokenizer
         detokenizer.reset()
         eos_ids = self._eos_ids()
         stripper = ThinkStripper() if no_think else None
+        # thinking 有効時は reasoning と content を分離してストリームする
+        splitter = (
+            ReasoningSplitter(in_think=prompt.rstrip().endswith("<think>"))
+            if not no_think
+            else None
+        )
 
         cached_cache, cached_len = kv_manager.lookup(prompt_ids, model)
 
@@ -1034,6 +1317,14 @@ class GenerationEngine:
                                 piece = stripper.feed(piece)
                                 if piece is not None:
                                     yield (piece, n)
+                            elif splitter is not None:
+                                r, c = splitter.feed(piece)
+                                if r:
+                                    yield {"reasoning": r}
+                                if c:
+                                    yield (c, n)
+                            else:
+                                yield (piece, n)
                         break
                 piece = detokenizer.last_segment
                 if not piece:
@@ -1044,9 +1335,19 @@ class GenerationEngine:
                     piece = stripper.feed(piece)
                     if piece is None:
                         continue
-                yield (piece, n)
+                    yield (piece, n)
+                elif splitter is not None:
+                    r, c = splitter.feed(piece)
+                    if r:
+                        yield {"reasoning": r}
+                    if c:
+                        yield (c, n)
+                else:
+                    yield (piece, n)
             if stripper is not None and stripper.pending:
                 yield (stripper.pending, n)
+            if splitter is not None and splitter.pending:
+                yield {"reasoning": splitter.pending}
         except Exception as e:
             print(f"[ENGINE] error at token {n}: {e}", file=sys.stderr, flush=True)
             raise
@@ -1059,6 +1360,33 @@ class GenerationEngine:
             if save_key_ids is not None:
                 kv_manager.save(save_key_ids, snap)
 
+    def _apply_tool_replay(self, messages: list) -> list:
+        """assistant tool_calls が全てい tool replay ストアに一致する場合、
+        生ブロックに置換して返す（KV キャッシュの prefix 一致を壊さない）。
+
+        - 一致時: assistant メッセージの content に生ブロックを連結し tool_calls を除去
+        - 不一致: そのまま
+        """
+        if not self._tool_replay or not messages:
+            return messages
+        out = []
+        for m in messages:
+            calls = m.get("tool_calls")
+            if m.get("role") == "assistant" and calls:
+                block = self._tool_replay.exact_block(calls)
+                if block is not None:
+                    content = m.get("content") or ""
+                    reasoning = m.get("reasoning") or ""
+                    if reasoning:
+                        content = f"<think>{reasoning}</think>{content}"
+                    nm = dict(m)
+                    nm["content"] = content + block
+                    nm.pop("tool_calls", None)
+                    out.append(nm)
+                    continue
+            out.append(m)
+        return out
+
     def _generate_impl(
         self,
         messages,
@@ -1070,7 +1398,19 @@ class GenerationEngine:
         seed=None,
         frequency_penalty=0.0,
         presence_penalty=0.0,
+        top_p=None,
+        top_k=None,
+        min_p=None,
+        reasoning_effort=None,
     ):
+        """messages 経路（tools / completions / responses / messages）の生成。
+
+        従来は全トークンを `output_ids` に溜めて最後に一括デコードしていたが、
+        detokenizer の差分を逐次 yield するストリーミング方式に変更した。
+        reasoning は `{"reasoning": ...}`、content は `(piece, n)`、
+        tool_calls は `{"tool_calls": [...]}` として順次返す。
+        tool 開始マーカー以降の content は送出しない（tool 領域をバッファ）。
+        """
         tokenizer = self._tokenizer
         model = self._model
         eos_ids = self._eos_ids()
@@ -1089,6 +1429,9 @@ class GenerationEngine:
         if presence_penalty:
             procs.append(make_presence_penalty(presence_penalty, 64))
 
+        messages = _normalize_tool_args(list(messages))
+        messages = self._apply_tool_replay(messages)
+
         if tools:
             messages = list(messages)
             messages.insert(
@@ -1104,110 +1447,190 @@ class GenerationEngine:
                 },
             )
 
-        MAX_ROUNDS = 10
-        round_idx = 0
-        yielded_prompt_tokens = False
+        prompt = tokenizer.apply_chat_template(
+            messages,
+            tools=tools,
+            add_generation_prompt=True,
+            tokenize=False,
+            enable_thinking=not no_think,
+        )
+        prompt_ids = tokenizer.encode(prompt)
 
-        while round_idx < MAX_ROUNDS:
-            prompt = tokenizer.apply_chat_template(
-                messages,
-                tools=tools if round_idx == 0 else None,
-                add_generation_prompt=True,
-                tokenize=False,
-                enable_thinking=not no_think,
-            )
-            prompt_ids = tokenizer.encode(prompt)
+        yield len(prompt_ids)
+        # 動的プリフィル調整（1回目のみ）: 最終チャンクが小さくなりすぎないよう調整
+        from stream_model import optimal_prefill_step
 
-            if not yielded_prompt_tokens:
-                yield len(prompt_ids)
-                yielded_prompt_tokens = True
-                # 動的プリフィル調整（1回目のみ）: 最終チャンクが小さくなりすぎないよう調整
-                from stream_model import optimal_prefill_step
+        PREFILL_STEP = optimal_prefill_step(len(prompt_ids))
+        print(
+            f"[ENGINE] prompt={len(prompt_ids)}tok max_tokens={max_tokens} temp={temperature} tools={bool(tools)}",
+            file=sys.stderr,
+            flush=True,
+        )
 
-                PREFILL_STEP = optimal_prefill_step(len(prompt_ids))
-                print(
-                    f"[ENGINE] prompt={len(prompt_ids)}tok max_tokens={max_tokens} temp={temperature} tools={bool(tools)}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+        prompt_cache = make_prompt_cache(model)
+        for i in range(0, len(prompt_ids), PREFILL_STEP):
+            model(mx.array([prompt_ids[i : i + PREFILL_STEP]]), cache=prompt_cache)
 
-            prompt_cache = make_prompt_cache(model)
-            for i in range(0, len(prompt_ids), PREFILL_STEP):
-                model(mx.array([prompt_ids[i : i + PREFILL_STEP]]), cache=prompt_cache)
+        sampler = make_sampler(**self._sampler_kwargs(temperature, top_p, top_k, min_p))
+        remaining = prompt_ids[-1:] if prompt_ids else [tokenizer.eos_token_id]
 
-            sampler = make_sampler(**self._sampler_kwargs(temperature))
-            remaining = prompt_ids[-1:] if prompt_ids else [tokenizer.eos_token_id]
+        detokenizer = tokenizer.detokenizer
+        detokenizer.reset()
+        _sent = 0  # detokenizer.text の送出済み文字位置
+        n = 0  # 生成トークン数（piece 数ではない）
+        tool_started = False  # tool マーカー開始以降は content を出さない
 
-            generate_t = time.time()
-            generator = generate_step(
-                mx.array(remaining),
-                model,
-                max_tokens=max_tokens,
-                sampler=sampler,
-                logits_processors=procs or None,
-                prompt_cache=prompt_cache,
-            )
-            output_ids = []
+        stripper = ThinkStripper() if no_think else None
+        splitter = (
+            ReasoningSplitter(in_think=prompt.rstrip().endswith("<think>"))
+            if not no_think
+            else None
+        )
+
+        def _emit_piece(piece, count):
+            """piece を reasoning/content に分割して yield する。"""
+            if stripper is not None:
+                out = stripper.feed(piece)
+                if out:
+                    yield (out, count)
+            elif splitter is not None:
+                r, c = splitter.feed(piece)
+                if r:
+                    yield {"reasoning": r}
+                if c:
+                    yield (c, count)
+            else:
+                yield (piece, count)
+
+        def _stop_cut(text: str) -> int | None:
+            """stop_list のいずれかが text に現れる最初の位置。無ければ None。"""
+            if not stop_list:
+                return None
+            cut = None
+            for s in stop_list:
+                if not s:
+                    continue
+                i = text.find(s)
+                if i != -1 and (cut is None or i < cut):
+                    cut = i
+            return cut
+
+        def _flush_content(final: bool = False):
+            """detokenizer.text の未送出部分を送出する。
+
+            tools 有効時は tool 開始マーカー以降を送出しない（後ろ倒し + 領域検出）。
+            """
+            nonlocal _sent
+            text = detokenizer.text
+            if len(text) <= _sent:
+                return
+            limit = len(text)
+            stop_at = _stop_cut(text)
+            if stop_at is not None:
+                limit = min(limit, stop_at)
+            if tools and not tool_started:
+                marker = _first_tool_marker(text)
+                if marker is not None:
+                    limit = min(limit, marker)
+                else:
+                    # マーカーがまだ現れていない: 末尾 LOOKAHEAD 分は保留
+                    limit = min(limit, len(text) - _TOOL_LOOKAHEAD)
+            if limit <= _sent:
+                return
+            piece = _clean_token_artifacts(text[_sent:limit])
+            _sent = limit
+            if not piece:
+                return
+            for y in _emit_piece(piece, n):
+                yield y
+
+        generate_t = time.time()
+        generator = generate_step(
+            mx.array(remaining),
+            model,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            logits_processors=procs or None,
+            prompt_cache=prompt_cache,
+        )
+        stop_hit = False
+        try:
             for token, _logprob in generator:
                 if token in eos_ids:
                     break
-                output_ids.append(token)
-            elapsed = time.time() - generate_t
-            print(
-                f"[ENGINE] round {round_idx}: {len(output_ids)} tokens in {elapsed:.1f}s",
-                file=sys.stderr,
-                flush=True,
-            )
+                detokenizer.add_token(token)
+                n += 1
+                text = detokenizer.text
 
-            if not output_ids:
-                break
+                # tool 完了 or 停止文字列の検出
+                if tools and not tool_started and _first_tool_marker(text) is not None:
+                    tool_started = True
+                    # マーカー以降を送出しないため、まず現時点まで flush
+                    for y in _flush_content():
+                        yield y
+                    if _tool_call_complete(text):
+                        break
+                    continue
+                if tools and tool_started:
+                    if _tool_call_complete(text):
+                        break
+                    continue
+                if _stop_cut(text) is not None:
+                    stop_hit = True
+                    for y in _flush_content(final=True):
+                        yield y
+                    break
+                for y in _flush_content():
+                    yield y
+        except Exception as e:
+            print(f"[ENGINE] error at token {n}: {e}", file=sys.stderr, flush=True)
+            raise
 
-            output_text = _clean_token_artifacts(
-                tokenizer.decode(output_ids, skip_special_tokens=False)
-            )
+        elapsed = time.time() - generate_t
+        print(
+            f"[ENGINE] stream {n} tokens in {elapsed:.1f}s"
+            f" ({n / max(elapsed, 1e-9):.1f} t/s)",
+            file=sys.stderr,
+            flush=True,
+        )
 
-            if tools:
-                clean_text, tool_calls = _extract_tool_calls(output_text)
-                if not tool_calls and "tool_call" in output_text.lower():
-                    # 抽出失敗（マーカー不一致の兆候）を可視化して調整を容易にする
-                    print(
-                        f"[ENGINE] ⚠️ tool_call らしき出力を抽出できず（マーカー要確認）: "
-                        f"{output_text[:240]!r}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-            else:
-                clean_text = output_text
-                tool_calls = []
+        # 残りの未送出分（stop 前 / tool 未開始時のみ全文送出）
+        if not stop_hit and not (tools and tool_started):
+            for y in _flush_content(final=True):
+                yield y
+        if stripper is not None and stripper.pending:
+            yield (stripper.pending, n)
+        if splitter is not None and splitter.pending:
+            yield {"reasoning": splitter.pending}
 
-            if not tool_calls:
-                # 生成は既に完了しているので全文をクリーニングして返す。
-                # detokenizer を逐次に流すとチャンネルマーカーや token artifact が
-                # 除去されず漏れる（これが <|channel>thought<channel|> 漏れの原因）。
-                text_out = _strip_channels(output_text)
-                if stop_list:
-                    cut = len(text_out)
-                    for s in stop_list:
-                        i = text_out.find(s)
-                        if i != -1 and i < cut:
-                            cut = i
-                    text_out = text_out[:cut]
-                if no_think:
-                    stripper = ThinkStripper()
-                    out = stripper.feed(text_out)
-                    text_out = (out or "") + stripper.pending
-                if text_out:
-                    yield (text_out, len(output_ids))
-                return
+        output_text = detokenizer.text
+        content_text = output_text
+        if not no_think:
+            _, content_text = _split_reasoning(output_text)
 
+        if tools:
+            clean_text, tool_calls = _extract_tool_calls(content_text)
+            if not tool_calls and "tool_call" in output_text.lower():
+                print(
+                    f"[ENGINE] ⚠️ tool_call らしき出力を抽出できず（マーカー要確認）: "
+                    f"{output_text[:240]!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        else:
+            clean_text = content_text
+            tool_calls = []
+
+        if tool_calls:
             # ① クライアント側ツール実行方式: サーバーでは実行せず tool_calls を返して終了。
-            # opencode 等の OpenAI 互換クライアントが自分でツールを実行し、結果を
-            # 次リクエストの role:tool メッセージとして送り返す（標準の function-calling）。
-            yield {
-                "tool_calls": tool_calls,
-                "content": _strip_channels(clean_text or "") or None,
-            }
-            return
+            # ② 永続 Tool replay: 生成済みの生ブロックを call ID ごとに保存する。
+            raw_block = ToolReplayStore.extract_raw_block(output_text)
+            if raw_block:
+                self._tool_replay.remember(tool_calls, raw_block)
+                self._tool_replay.persist()
+            # content はストリーム送出済みのため dict では渡さない
+            yield {"tool_calls": tool_calls}
+        return
 
 
 engine: GenerationEngine = None
@@ -1234,6 +1657,12 @@ class APIHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/v1/chat/completions":
             return self._handle_chat_completions()
+        if path == "/v1/completions":
+            return self._handle_completions()
+        if path == "/v1/responses":
+            return self._handle_responses()
+        if path == "/v1/messages":
+            return self._handle_messages()
         self._send_error(404, f"Not found: {path}", code="not_found")
 
     # ---- handlers ----
@@ -1252,26 +1681,25 @@ class APIHandler(BaseHTTPRequestHandler):
         }
         self._send_json(200, data)
 
-    def _handle_chat_completions(self):
+    def _read_body(self) -> dict:
+        """リクエストボディを JSON として読む。不正ならエラーレスポンスを返す（None を返す）。"""
         try:
             content_len = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(content_len)) if content_len else {}
         except (json.JSONDecodeError, ValueError) as e:
-            return self._send_json(400, {"error": "invalid_request", "message": str(e)})
+            self._send_json(400, {"error": "invalid_request", "message": str(e)})
+            return None
+        if not isinstance(body, dict):
+            self._send_json(
+                400,
+                {"error": "invalid_request", "message": "body must be a JSON object"},
+            )
+            return None
+        return body
 
-        messages = body.get("messages", [])
-        messages = _normalize_tool_args(messages)
-        req_id = body.get("model", "?")
-        stream = body.get("stream", False)
-        print(
-            f"[API] chat req model={req_id} stream={stream} msgs={len(messages)} t0={time.time():.3f}",
-            file=sys.stderr,
-            flush=True,
-        )
-        if not messages:
-            return self._send_error(400, "messages is required", code="invalid_request")
-        if req_id != "?" and req_id != MODEL_ID:
-            return self._send_error(
+    def _check_model(self, req_id):
+        if req_id is not None and req_id != "?" and req_id != MODEL_ID:
+            self._send_error(
                 400,
                 (
                     f"model='{req_id}' はロードされていません。"
@@ -1280,30 +1708,91 @@ class APIHandler(BaseHTTPRequestHandler):
                 ),
                 code="model_not_loaded",
             )
+            return False
+        return True
 
+    def _default_temp(self) -> float:
+        eng = _get_engine()
+        if eng._model_type == "gemma4":
+            return 1.0
+        if "ornith" in eng._model_name:
+            return 1.0
+        if "glm" in eng._model_name:
+            return 1.0
+        return TEMP
+
+    def _common_params(self, body: dict):
+        """chat / responses / messages 共通の生成パラメータを抽出する。"""
         max_tokens = min(body.get("max_tokens", MAX_TOKENS), MAX_TOKENS)
         max_completion_tokens = body.get("max_completion_tokens")
         if max_completion_tokens is not None:
             max_tokens = min(max_completion_tokens, MAX_TOKENS)
-        eng = _get_engine()
-        if eng._model_type == "gemma4":
-            _def_temp = 1.0
-        elif "ornith" in eng._model_name:
-            _def_temp = 1.0
-        elif "glm" in eng._model_name:
-            _def_temp = 1.0
-        else:
-            _def_temp = TEMP
-        temperature = body.get("temperature", _def_temp)
-        tools = body.get("tools", None)
-        tool_choice = body.get("tool_choice", "auto")
-        stop = body.get("stop")
-        seed = body.get("seed")
-        frequency_penalty = body.get("frequency_penalty", 0.0)
-        presence_penalty = body.get("presence_penalty", 0.0)
-        n = body.get("n", 1)
-        include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
+        thinking = _reasoning_enabled(
+            body.get("thinking"), body.get("think"), body.get("reasoning_effort")
+        )
+        return {
+            "max_tokens": max_tokens,
+            "temperature": body.get("temperature", self._default_temp()),
+            "top_p": body.get("top_p"),
+            "top_k": body.get("top_k"),
+            "min_p": body.get("min_p"),
+            "thinking": thinking,
+            "no_think": not thinking,
+            "stop": body.get("stop"),
+            "seed": body.get("seed"),
+            "frequency_penalty": body.get("frequency_penalty", 0.0),
+            "presence_penalty": body.get("presence_penalty", 0.0),
+            "include_usage": bool(
+                (body.get("stream_options") or {}).get("include_usage")
+            ),
+            "reasoning_effort": body.get("reasoning_effort"),
+        }
 
+    def _tools_for(self, body: dict, messages: list) -> tuple[list | None, bool]:
+        """tools / tool_choice / MCP 注入を解決する。
+
+        戻り値: (tools, tool_choice_none)
+        - tool_choice == "none" → tools を無効化
+        - tools 未指定 → MCP ツールがあれば注入
+        """
+        tools = body.get("tools")
+        tool_choice = body.get("tool_choice", "auto")
+        if isinstance(tool_choice, str) and tool_choice.lower() == "none":
+            return None, True
+        if tools is None:
+            mcp_tools = mcp_manager.get_openai_tools()
+            if mcp_tools:
+                tools = mcp_tools
+                tool_choice = "auto"
+                print(
+                    f"[API] クライアントからツール未指定 → MCP {len(mcp_tools)} ツールを注入",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        return tools, False
+
+    def _handle_chat_completions(self):
+        body = self._read_body()
+        if body is None:
+            return
+        if not self._check_model(body.get("model")):
+            return
+
+        messages = body.get("messages", [])
+        stream = body.get("stream", False)
+        print(
+            f"[API] chat req model={body.get('model', '?')} stream={stream} msgs={len(messages)} t0={time.time():.3f}",
+            file=sys.stderr,
+            flush=True,
+        )
+        if not messages:
+            return self._send_error(400, "messages is required", code="invalid_request")
+        if not isinstance(messages, list):
+            return self._send_error(
+                400, "messages must be an array", code="invalid_request"
+            )
+
+        n = body.get("n", 1)
         if n != 1:
             return self._send_error(
                 400, "n は 1 のみサポートされています", param="n", code="unsupported"
@@ -1321,16 +1810,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     400, f"{field} は未サポートです", param=field, code="unsupported"
                 )
 
-        if tools is None:
-            mcp_tools = mcp_manager.get_openai_tools()
-            if mcp_tools:
-                tools = mcp_tools
-                tool_choice = "auto"
-                print(
-                    f"[API] クライアントからツール未指定 → MCP {len(mcp_tools)} ツールを注入",
-                    file=sys.stderr,
-                    flush=True,
-                )
+        p = self._common_params(body)
+        messages = _normalize_messages(messages)
+        tools, _none = self._tools_for(body, messages)
 
         # ツールなし → 従来通り API ハンドラ側で prompt レンダリング（高速パス）
         # ツールあり → エンジンに messages + tools を渡してループ処理
@@ -1340,13 +1822,13 @@ class APIHandler(BaseHTTPRequestHandler):
                     messages,
                     add_generation_prompt=True,
                     tokenize=False,
-                    enable_thinking=not NO_THINK,
+                    enable_thinking=p["thinking"],
                 )
                 prompt_nogen = self._tokenizer.apply_chat_template(
                     messages,
                     add_generation_prompt=False,
                     tokenize=False,
-                    enable_thinking=not NO_THINK,
+                    enable_thinking=p["thinking"],
                 )
             except Exception as e:
                 return self._send_error(
@@ -1357,48 +1839,66 @@ class APIHandler(BaseHTTPRequestHandler):
                 self._handle_stream_legacy(
                     prompt,
                     prompt_nogen,
-                    max_tokens,
-                    temperature,
-                    stop,
-                    seed,
-                    frequency_penalty,
-                    presence_penalty,
-                    include_usage,
+                    p["max_tokens"],
+                    p["temperature"],
+                    p["no_think"],
+                    p["stop"],
+                    p["seed"],
+                    p["frequency_penalty"],
+                    p["presence_penalty"],
+                    p["top_p"],
+                    p["top_k"],
+                    p["min_p"],
+                    p["include_usage"],
                 )
             else:
                 self._handle_nonstream_legacy(
                     prompt,
                     prompt_nogen,
-                    max_tokens,
-                    temperature,
-                    stop,
-                    seed,
-                    frequency_penalty,
-                    presence_penalty,
+                    p["max_tokens"],
+                    p["temperature"],
+                    p["no_think"],
+                    p["stop"],
+                    p["seed"],
+                    p["frequency_penalty"],
+                    p["presence_penalty"],
+                    p["top_p"],
+                    p["top_k"],
+                    p["min_p"],
                 )
         else:
             if stream:
                 self._handle_stream_tools(
                     messages,
-                    max_tokens,
-                    temperature,
+                    p["max_tokens"],
+                    p["temperature"],
+                    p["no_think"],
                     tools,
-                    stop,
-                    seed,
-                    frequency_penalty,
-                    presence_penalty,
-                    include_usage,
+                    p["stop"],
+                    p["seed"],
+                    p["frequency_penalty"],
+                    p["presence_penalty"],
+                    p["top_p"],
+                    p["top_k"],
+                    p["min_p"],
+                    p["include_usage"],
+                    p["reasoning_effort"],
                 )
             else:
                 self._handle_nonstream_tools(
                     messages,
-                    max_tokens,
-                    temperature,
+                    p["max_tokens"],
+                    p["temperature"],
+                    p["no_think"],
                     tools,
-                    stop,
-                    seed,
-                    frequency_penalty,
-                    presence_penalty,
+                    p["stop"],
+                    p["seed"],
+                    p["frequency_penalty"],
+                    p["presence_penalty"],
+                    p["top_p"],
+                    p["top_k"],
+                    p["min_p"],
+                    p["reasoning_effort"],
                 )
 
     @property
@@ -1413,10 +1913,14 @@ class APIHandler(BaseHTTPRequestHandler):
         prompt_nogen,
         max_tokens,
         temperature,
+        no_think,
         stop=None,
         seed=None,
         frequency_penalty=0.0,
         presence_penalty=0.0,
+        top_p=None,
+        top_k=None,
+        min_p=None,
         include_usage=False,
     ):
         t0 = time.time()
@@ -1439,16 +1943,35 @@ class APIHandler(BaseHTTPRequestHandler):
             prompt_nogen,
             max_tokens,
             temperature,
-            NO_THINK,
+            no_think,
             stop,
             seed,
             frequency_penalty,
             presence_penalty,
+            top_p,
+            top_k,
+            min_p,
         )
         try:
             for msg in gen:
                 if isinstance(msg, int):
                     prompt_tokens = msg
+                    continue
+                if isinstance(msg, dict) and "reasoning" in msg:
+                    rchunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": MODEL_ID,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"reasoning_content": msg["reasoning"]},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    self._sse(json.dumps(rchunk, ensure_ascii=False))
                     continue
                 piece, n = msg
                 chunk = {
@@ -1510,13 +2033,18 @@ class APIHandler(BaseHTTPRequestHandler):
         prompt_nogen,
         max_tokens,
         temperature,
+        no_think,
         stop=None,
         seed=None,
         frequency_penalty=0.0,
         presence_penalty=0.0,
+        top_p=None,
+        top_k=None,
+        min_p=None,
     ):
         t0 = time.time()
         pieces = []
+        reasoning_parts = []
         total = 0
         prompt_tokens = 0
         gen = _get_engine().generate_prompt(
@@ -1524,16 +2052,22 @@ class APIHandler(BaseHTTPRequestHandler):
             prompt_nogen,
             max_tokens,
             temperature,
-            NO_THINK,
+            no_think,
             stop,
             seed,
             frequency_penalty,
             presence_penalty,
+            top_p,
+            top_k,
+            min_p,
         )
         try:
             for msg in gen:
                 if isinstance(msg, int):
                     prompt_tokens = msg
+                    continue
+                if isinstance(msg, dict) and "reasoning" in msg:
+                    reasoning_parts.append(msg["reasoning"])
                     continue
                 piece, n = msg
                 pieces.append(piece)
@@ -1550,6 +2084,9 @@ class APIHandler(BaseHTTPRequestHandler):
             file=sys.stderr,
             flush=True,
         )
+        message = {"role": "assistant", "content": text}
+        if reasoning_parts:
+            message["reasoning_content"] = "".join(reasoning_parts)
         resp = {
             "id": f"chatcmpl-{int(time.time())}",
             "object": "chat.completion",
@@ -1558,7 +2095,7 @@ class APIHandler(BaseHTTPRequestHandler):
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": text},
+                    "message": message,
                     "finish_reason": "stop",
                 }
             ],
@@ -1577,12 +2114,17 @@ class APIHandler(BaseHTTPRequestHandler):
         messages,
         max_tokens,
         temperature,
+        no_think,
         tools,
         stop=None,
         seed=None,
         frequency_penalty=0.0,
         presence_penalty=0.0,
+        top_p=None,
+        top_k=None,
+        min_p=None,
         include_usage=False,
+        reasoning_effort=None,
     ):
         t0 = time.time()
         self.send_response(200)
@@ -1603,12 +2145,16 @@ class APIHandler(BaseHTTPRequestHandler):
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
-            no_think=NO_THINK,
+            no_think=no_think,
             tools=tools,
             stop=stop,
             seed=seed,
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            reasoning_effort=reasoning_effort,
         )
         finish_reason = "stop"
         try:
@@ -1616,28 +2162,24 @@ class APIHandler(BaseHTTPRequestHandler):
                 if isinstance(msg, int):
                     prompt_tokens = msg
                     continue
+                if isinstance(msg, dict) and "reasoning" in msg:
+                    rchunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": MODEL_ID,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"reasoning_content": msg["reasoning"]},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    self._sse(json.dumps(rchunk, ensure_ascii=False))
+                    continue
                 if isinstance(msg, dict) and "tool_calls" in msg:
                     # ① tool_calls を OpenAI ストリーミング形式の delta で返す（サーバー実行しない）
-                    ctext = msg.get("content") or ""
-                    if ctext:
-                        self._sse(
-                            json.dumps(
-                                {
-                                    "id": completion_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created,
-                                    "model": MODEL_ID,
-                                    "choices": [
-                                        {
-                                            "index": 0,
-                                            "delta": {"content": ctext},
-                                            "finish_reason": None,
-                                        }
-                                    ],
-                                },
-                                ensure_ascii=False,
-                            )
-                        )
                     tc_delta = [
                         {
                             "index": i,
@@ -1731,37 +2273,48 @@ class APIHandler(BaseHTTPRequestHandler):
         messages,
         max_tokens,
         temperature,
+        no_think,
         tools,
         stop=None,
         seed=None,
         frequency_penalty=0.0,
         presence_penalty=0.0,
+        top_p=None,
+        top_k=None,
+        min_p=None,
+        reasoning_effort=None,
     ):
         t0 = time.time()
         pieces = []
+        reasoning_parts = []
         total = 0
         prompt_tokens = 0
         gen = _get_engine().generate(
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
-            no_think=NO_THINK,
+            no_think=no_think,
             tools=tools,
             stop=stop,
             seed=seed,
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            reasoning_effort=reasoning_effort,
         )
         tool_calls = None
-        tc_content = ""
         try:
             for msg in gen:
                 if isinstance(msg, int):
                     prompt_tokens = msg
                     continue
+                if isinstance(msg, dict) and "reasoning" in msg:
+                    reasoning_parts.append(msg["reasoning"])
+                    continue
                 if isinstance(msg, dict) and "tool_calls" in msg:
                     tool_calls = msg["tool_calls"]
-                    tc_content = msg.get("content") or ""
                     continue
                 piece, n = msg
                 pieces.append(piece)
@@ -1781,13 +2334,15 @@ class APIHandler(BaseHTTPRequestHandler):
         if tool_calls:
             message = {
                 "role": "assistant",
-                "content": tc_content or None,
+                "content": "".join(pieces) or None,
                 "tool_calls": tool_calls,
             }
             finish_reason = "tool_calls"
         else:
             message = {"role": "assistant", "content": "".join(pieces)}
             finish_reason = "stop"
+        if reasoning_parts:
+            message["reasoning_content"] = "".join(reasoning_parts)
         resp = {
             "id": f"chatcmpl-{int(time.time())}",
             "object": "chat.completion",
@@ -1807,6 +2362,905 @@ class APIHandler(BaseHTTPRequestHandler):
             },
         }
         self._send_json(200, resp)
+
+    # ---- /v1/completions（OpenAI テキスト補完） ----
+
+    def _handle_completions(self):
+        body = self._read_body()
+        if body is None:
+            return
+        if not self._check_model(body.get("model")):
+            return
+
+        prompt = body.get("prompt")
+        stream = body.get("stream", False)
+        print(
+            f"[API] completions req model={body.get('model', '?')} stream={stream} t0={time.time():.3f}",
+            file=sys.stderr,
+            flush=True,
+        )
+        if prompt is None:
+            return self._send_error(400, "prompt is required", code="invalid_request")
+
+        p = self._common_params(body)
+        messages = [{"role": "user", "content": prompt}]
+        if stream:
+            self._handle_stream_completions(
+                messages,
+                p["max_tokens"],
+                p["temperature"],
+                p["no_think"],
+                p["stop"],
+                p["seed"],
+                p["frequency_penalty"],
+                p["presence_penalty"],
+                p["top_p"],
+                p["top_k"],
+                p["min_p"],
+                p["include_usage"],
+            )
+        else:
+            self._handle_nonstream_completions(
+                messages,
+                p["max_tokens"],
+                p["temperature"],
+                p["no_think"],
+                p["stop"],
+                p["seed"],
+                p["frequency_penalty"],
+                p["presence_penalty"],
+                p["top_p"],
+                p["top_k"],
+                p["min_p"],
+            )
+
+    def _handle_stream_completions(
+        self,
+        messages,
+        max_tokens,
+        temperature,
+        no_think,
+        stop=None,
+        seed=None,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+        top_p=None,
+        top_k=None,
+        min_p=None,
+        include_usage=False,
+    ):
+        self.send_response(200)
+        self._cors_headers()
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        completion_id = f"cmpl-{int(time.time())}"
+        created = int(time.time())
+        total = 0
+        prompt_tokens = 0
+        gen = _get_engine().generate(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            no_think=no_think,
+            tools=None,
+            stop=stop,
+            seed=seed,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+        )
+        try:
+            for msg in gen:
+                if isinstance(msg, int):
+                    prompt_tokens = msg
+                    continue
+                if isinstance(msg, dict):
+                    continue  # reasoning / tool_calls は completions では出さない
+                piece, n = msg
+                chunk = {
+                    "id": completion_id,
+                    "object": "text_completion",
+                    "created": created,
+                    "model": MODEL_ID,
+                    "choices": [{"index": 0, "text": piece, "finish_reason": None}],
+                }
+                self._sse(json.dumps(chunk, ensure_ascii=False))
+                total = n
+        except Exception as e:
+            print(f"[API] completions stream error: {e}", file=sys.stderr, flush=True)
+            return
+        done = {
+            "id": completion_id,
+            "object": "text_completion",
+            "created": created,
+            "model": MODEL_ID,
+            "choices": [{"index": 0, "text": "", "finish_reason": "stop"}],
+        }
+        if include_usage:
+            done["usage"] = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": total,
+                "total_tokens": prompt_tokens + total,
+            }
+        self._sse(json.dumps(done, ensure_ascii=False))
+        self._sse("[DONE]")
+
+    def _handle_nonstream_completions(
+        self,
+        messages,
+        max_tokens,
+        temperature,
+        no_think,
+        stop=None,
+        seed=None,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+        top_p=None,
+        top_k=None,
+        min_p=None,
+    ):
+        pieces = []
+        total = 0
+        prompt_tokens = 0
+        gen = _get_engine().generate(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            no_think=no_think,
+            tools=None,
+            stop=stop,
+            seed=seed,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+        )
+        try:
+            for msg in gen:
+                if isinstance(msg, int):
+                    prompt_tokens = msg
+                    continue
+                if isinstance(msg, dict):
+                    continue
+                piece, n = msg
+                pieces.append(piece)
+                total = n
+        except Exception as e:
+            print(f"[API] completions generate error: {e}", file=sys.stderr, flush=True)
+            return self._send_error(
+                500, str(e), type="server_error", code="generation_error"
+            )
+        resp = {
+            "id": f"cmpl-{int(time.time())}",
+            "object": "text_completion",
+            "created": int(time.time()),
+            "model": MODEL_ID,
+            "choices": [{"index": 0, "text": "".join(pieces), "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": total,
+                "total_tokens": prompt_tokens + total,
+            },
+        }
+        self._send_json(200, resp)
+
+    # ---- /v1/responses（OpenAI Responses API） ----
+
+    def _responses_messages(self, body: dict) -> list:
+        """input（文字列 or アイテム配列）を messages に変換する。"""
+        messages = []
+        instructions = body.get("instructions")
+        if isinstance(instructions, str) and instructions.strip():
+            messages.append({"role": "system", "content": instructions})
+        elif isinstance(instructions, list):
+            text = "".join(
+                b.get("text", "") if isinstance(b, dict) else str(b)
+                for b in instructions
+            )
+            if text.strip():
+                messages.append({"role": "system", "content": text})
+
+        inp = body.get("input")
+        if isinstance(inp, str):
+            messages.append({"role": "user", "content": inp})
+            return messages
+        if not isinstance(inp, list):
+            return messages
+        for item in inp:
+            if isinstance(item, str):
+                messages.append({"role": "user", "content": item})
+                continue
+            if not isinstance(item, dict):
+                continue
+            itype = item.get("type", "message")
+            if itype == "message":
+                role = item.get("role", "user")
+                content = item.get("content")
+                messages.append(
+                    {"role": role, "content": content if content is not None else ""}
+                )
+            elif itype == "input_text":
+                messages.append({"role": "user", "content": item.get("text", "")})
+            elif itype == "function_call":
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": item.get("call_id")
+                                or f"call_{uuid.uuid4().hex[:12]}",
+                                "type": "function",
+                                "function": {
+                                    "name": item.get("name", ""),
+                                    "arguments": json.dumps(
+                                        item.get("arguments") or {},
+                                        ensure_ascii=False,
+                                    ),
+                                },
+                            }
+                        ],
+                    }
+                )
+            elif itype == "function_call_output":
+                messages.append(
+                    {
+                        "role": "tool",
+                        "content": item.get("output") or "",
+                        "tool_call_id": item.get("call_id"),
+                    }
+                )
+            else:
+                text = item.get("text")
+                if text:
+                    messages.append({"role": "user", "content": text})
+        return messages
+
+    def _handle_responses(self):
+        body = self._read_body()
+        if body is None:
+            return
+        if not self._check_model(body.get("model")):
+            return
+
+        stream = body.get("stream", False)
+        print(
+            f"[API] responses req model={body.get('model', '?')} stream={stream} t0={time.time():.3f}",
+            file=sys.stderr,
+            flush=True,
+        )
+        messages = self._responses_messages(body)
+        if not messages:
+            return self._send_error(400, "input is required", code="invalid_request")
+
+        p = self._common_params(body)
+        tools, _none = self._tools_for(body, messages)
+        if stream:
+            self._handle_stream_responses(
+                messages,
+                p["max_tokens"],
+                p["temperature"],
+                p["no_think"],
+                tools,
+                p["stop"],
+                p["seed"],
+                p["frequency_penalty"],
+                p["presence_penalty"],
+                p["top_p"],
+                p["top_k"],
+                p["min_p"],
+                p["reasoning_effort"],
+            )
+        else:
+            self._handle_nonstream_responses(
+                messages,
+                p["max_tokens"],
+                p["temperature"],
+                p["no_think"],
+                tools,
+                p["stop"],
+                p["seed"],
+                p["frequency_penalty"],
+                p["presence_penalty"],
+                p["top_p"],
+                p["top_k"],
+                p["min_p"],
+                p["reasoning_effort"],
+            )
+
+    def _responses_output(
+        self,
+        reasoning: str,
+        content: str,
+        tool_calls: list | None,
+        completion_id: str,
+    ) -> list:
+        out = []
+        if reasoning:
+            out.append(
+                {
+                    "id": f"rs_{completion_id}",
+                    "type": "reasoning",
+                    "status": "completed",
+                    "summary": [{"type": "summary_text", "text": reasoning}],
+                }
+            )
+        if content:
+            out.append(
+                {
+                    "id": f"msg_{completion_id}",
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": content, "annotations": []}
+                    ],
+                }
+            )
+        for call in tool_calls or []:
+            out.append(
+                {
+                    "id": f"fc_{call.get('id', '')}",
+                    "type": "function_call",
+                    "status": "completed",
+                    "call_id": call.get("id", ""),
+                    "name": call.get("function", {}).get("name", ""),
+                    "arguments": call.get("function", {}).get("arguments", "{}"),
+                }
+            )
+        return out
+
+    def _handle_nonstream_responses(
+        self,
+        messages,
+        max_tokens,
+        temperature,
+        no_think,
+        tools,
+        stop=None,
+        seed=None,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+        top_p=None,
+        top_k=None,
+        min_p=None,
+        reasoning_effort=None,
+    ):
+        pieces = []
+        reasoning_parts = []
+        total = 0
+        prompt_tokens = 0
+        tool_calls = None
+        gen = _get_engine().generate(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            no_think=no_think,
+            tools=tools,
+            stop=stop,
+            seed=seed,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            reasoning_effort=reasoning_effort,
+        )
+        try:
+            for msg in gen:
+                if isinstance(msg, int):
+                    prompt_tokens = msg
+                    continue
+                if isinstance(msg, dict) and "reasoning" in msg:
+                    reasoning_parts.append(msg["reasoning"])
+                    continue
+                if isinstance(msg, dict) and "tool_calls" in msg:
+                    tool_calls = msg["tool_calls"]
+                    continue
+                piece, n = msg
+                pieces.append(piece)
+                total = n
+        except Exception as e:
+            print(f"[API] responses generate error: {e}", file=sys.stderr, flush=True)
+            return self._send_error(
+                500, str(e), type="server_error", code="generation_error"
+            )
+        cid = f"resp_{uuid.uuid4().hex[:20]}"
+        resp = {
+            "id": cid,
+            "object": "response",
+            "created_at": int(time.time()),
+            "status": "completed",
+            "model": MODEL_ID,
+            "output": self._responses_output(
+                "".join(reasoning_parts), "".join(pieces), tool_calls, cid
+            ),
+            "usage": {
+                "input_tokens": prompt_tokens,
+                "output_tokens": total,
+                "total_tokens": prompt_tokens + total,
+            },
+        }
+        self._send_json(200, resp)
+
+    def _handle_stream_responses(
+        self,
+        messages,
+        max_tokens,
+        temperature,
+        no_think,
+        tools,
+        stop=None,
+        seed=None,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+        top_p=None,
+        top_k=None,
+        min_p=None,
+        reasoning_effort=None,
+    ):
+        self.send_response(200)
+        self._cors_headers()
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        cid = f"resp_{uuid.uuid4().hex[:20]}"
+        self._sse(
+            json.dumps(
+                {
+                    "type": "response.created",
+                    "response": {
+                        "id": cid,
+                        "object": "response",
+                        "status": "in_progress",
+                        "model": MODEL_ID,
+                    },
+                },
+                ensure_ascii=False,
+            )
+        )
+        reasoning_buf = ""
+        content_buf = ""
+        total = 0
+        prompt_tokens = 0
+        tool_calls = None
+        gen = _get_engine().generate(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            no_think=no_think,
+            tools=tools,
+            stop=stop,
+            seed=seed,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            reasoning_effort=reasoning_effort,
+        )
+        try:
+            for msg in gen:
+                if isinstance(msg, int):
+                    prompt_tokens = msg
+                    continue
+                if isinstance(msg, dict) and "reasoning" in msg:
+                    reasoning_buf += msg["reasoning"]
+                    continue
+                if isinstance(msg, dict) and "tool_calls" in msg:
+                    tool_calls = msg["tool_calls"]
+                    continue
+                piece, n = msg
+                content_buf += piece
+                total = n
+                self._sse(
+                    json.dumps(
+                        {
+                            "type": "response.output_text.delta",
+                            "delta": piece,
+                            "item_id": f"msg_{cid}",
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+        except Exception as e:
+            print(f"[API] responses stream error: {e}", file=sys.stderr, flush=True)
+            return
+        out = self._responses_output(reasoning_buf, content_buf, tool_calls, cid)
+        self._sse(
+            json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": cid,
+                        "object": "response",
+                        "status": "completed",
+                        "model": MODEL_ID,
+                        "output": out,
+                        "usage": {
+                            "input_tokens": prompt_tokens,
+                            "output_tokens": total,
+                            "total_tokens": prompt_tokens + total,
+                        },
+                    },
+                },
+                ensure_ascii=False,
+            )
+        )
+        self._sse("[DONE]")
+
+    # ---- /v1/messages（Anthropic 互換） ----
+
+    def _anthropic_messages(self, body: dict) -> list:
+        messages = []
+        system = body.get("system")
+        if isinstance(system, str) and system.strip():
+            messages.append({"role": "system", "content": system})
+        elif isinstance(system, list):
+            text = "".join(
+                b.get("text", "") if isinstance(b, dict) else str(b) for b in system
+            )
+            if text.strip():
+                messages.append({"role": "system", "content": text})
+        for m in body.get("messages", []):
+            if not isinstance(m, dict):
+                continue
+            messages.append(_normalize_message(m))
+        return messages
+
+    def _anthropic_tools(self, tools: list) -> list | None:
+        """Anthropic 形式のツール定義（name/description/input_schema）を OpenAI 形式に変換する。"""
+        if not tools:
+            return None
+        out = []
+        for t in tools:
+            if not isinstance(t, dict):
+                continue
+            out.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": t.get("name", ""),
+                        "description": t.get("description", ""),
+                        "parameters": t.get("input_schema") or {},
+                    },
+                }
+            )
+        return out
+
+    def _handle_messages(self):
+        body = self._read_body()
+        if body is None:
+            return
+        if not self._check_model(body.get("model")):
+            return
+
+        stream = body.get("stream", False)
+        print(
+            f"[API] messages req model={body.get('model', '?')} stream={stream} t0={time.time():.3f}",
+            file=sys.stderr,
+            flush=True,
+        )
+        messages = self._anthropic_messages(body)
+        if not messages:
+            return self._send_error(400, "messages is required", code="invalid_request")
+
+        p = self._common_params(body)
+        p["stop"] = body.get("stop_sequences")
+        tools = self._anthropic_tools(body.get("tools"))
+        if stream:
+            self._handle_stream_messages(
+                messages,
+                p["max_tokens"],
+                p["temperature"],
+                p["no_think"],
+                tools,
+                p["stop"],
+                p["seed"],
+                p["frequency_penalty"],
+                p["presence_penalty"],
+                p["top_p"],
+                p["top_k"],
+                p["min_p"],
+            )
+        else:
+            self._handle_nonstream_messages(
+                messages,
+                p["max_tokens"],
+                p["temperature"],
+                p["no_think"],
+                tools,
+                p["stop"],
+                p["seed"],
+                p["frequency_penalty"],
+                p["presence_penalty"],
+                p["top_p"],
+                p["top_k"],
+                p["min_p"],
+            )
+
+    def _anthropic_content(
+        self, reasoning: str, content: str, tool_calls: list | None
+    ) -> list:
+        blocks = []
+        if reasoning:
+            blocks.append({"type": "thinking", "thinking": reasoning, "signature": ""})
+        if content:
+            blocks.append({"type": "text", "text": content})
+        for call in tool_calls or []:
+            fn = call.get("function", {})
+            try:
+                args = json.loads(fn.get("arguments", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                args = fn.get("arguments") or {}
+            blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": call.get("id", ""),
+                    "name": fn.get("name", ""),
+                    "input": args,
+                }
+            )
+        return blocks
+
+    def _handle_nonstream_messages(
+        self,
+        messages,
+        max_tokens,
+        temperature,
+        no_think,
+        tools,
+        stop=None,
+        seed=None,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+        top_p=None,
+        top_k=None,
+        min_p=None,
+    ):
+        pieces = []
+        reasoning_parts = []
+        total = 0
+        prompt_tokens = 0
+        tool_calls = None
+        gen = _get_engine().generate(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            no_think=no_think,
+            tools=tools,
+            stop=stop,
+            seed=seed,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+        )
+        try:
+            for msg in gen:
+                if isinstance(msg, int):
+                    prompt_tokens = msg
+                    continue
+                if isinstance(msg, dict) and "reasoning" in msg:
+                    reasoning_parts.append(msg["reasoning"])
+                    continue
+                if isinstance(msg, dict) and "tool_calls" in msg:
+                    tool_calls = msg["tool_calls"]
+                    continue
+                piece, n = msg
+                pieces.append(piece)
+                total = n
+        except Exception as e:
+            print(f"[API] messages generate error: {e}", file=sys.stderr, flush=True)
+            return self._send_error(
+                500, str(e), type="server_error", code="generation_error"
+            )
+        content = self._anthropic_content(
+            "".join(reasoning_parts), "".join(pieces), tool_calls
+        )
+        resp = {
+            "id": f"msg_{uuid.uuid4().hex[:20]}",
+            "type": "message",
+            "role": "assistant",
+            "model": MODEL_ID,
+            "content": content,
+            "stop_reason": "tool_use" if tool_calls else "end_turn",
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": prompt_tokens,
+                "output_tokens": total,
+            },
+        }
+        self._send_json(200, resp)
+
+    def _handle_stream_messages(
+        self,
+        messages,
+        max_tokens,
+        temperature,
+        no_think,
+        tools,
+        stop=None,
+        seed=None,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+        top_p=None,
+        top_k=None,
+        min_p=None,
+    ):
+        self.send_response(200)
+        self._cors_headers()
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        mid = f"msg_{uuid.uuid4().hex[:20]}"
+        self._sse(
+            json.dumps(
+                {
+                    "type": "message_start",
+                    "message": {
+                        "id": mid,
+                        "type": "message",
+                        "role": "assistant",
+                        "model": MODEL_ID,
+                        "content": [],
+                        "stop_reason": None,
+                        "usage": {"input_tokens": 0, "output_tokens": 0},
+                    },
+                },
+                ensure_ascii=False,
+            )
+        )
+        reasoning_buf = ""
+        content_buf = ""
+        total = 0
+        prompt_tokens = 0
+        tool_calls = None
+        block_index = 0
+        text_started = False
+        gen = _get_engine().generate(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            no_think=no_think,
+            tools=tools,
+            stop=stop,
+            seed=seed,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+        )
+        try:
+            for msg in gen:
+                if isinstance(msg, int):
+                    prompt_tokens = msg
+                    continue
+                if isinstance(msg, dict) and "reasoning" in msg:
+                    reasoning_buf += msg["reasoning"]
+                    continue
+                if isinstance(msg, dict) and "tool_calls" in msg:
+                    tool_calls = msg["tool_calls"]
+                    continue
+                piece, n = msg
+                if not text_started:
+                    text_started = True
+                    self._sse(
+                        json.dumps(
+                            {
+                                "type": "content_block_start",
+                                "index": block_index,
+                                "content_block": {"type": "text", "text": ""},
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                content_buf += piece
+                total = n
+                self._sse(
+                    json.dumps(
+                        {
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {"type": "text_delta", "text": piece},
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+        except Exception as e:
+            print(f"[API] messages stream error: {e}", file=sys.stderr, flush=True)
+            return
+        if text_started:
+            self._sse(
+                json.dumps(
+                    {"type": "content_block_stop", "index": block_index},
+                    ensure_ascii=False,
+                )
+            )
+            block_index += 1
+        # thinking / tool_use ブロックを後続で追加
+        if reasoning_buf:
+            self._sse(
+                json.dumps(
+                    {
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {
+                            "type": "thinking",
+                            "thinking": reasoning_buf,
+                            "signature": "",
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            self._sse(
+                json.dumps(
+                    {"type": "content_block_stop", "index": block_index},
+                    ensure_ascii=False,
+                )
+            )
+            block_index += 1
+        for call in tool_calls or []:
+            fn = call.get("function", {})
+            try:
+                args = json.loads(fn.get("arguments", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                args = fn.get("arguments") or {}
+            self._sse(
+                json.dumps(
+                    {
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": call.get("id", ""),
+                            "name": fn.get("name", ""),
+                            "input": args,
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            self._sse(
+                json.dumps(
+                    {"type": "content_block_stop", "index": block_index},
+                    ensure_ascii=False,
+                )
+            )
+            block_index += 1
+        self._sse(
+            json.dumps(
+                {
+                    "type": "message_delta",
+                    "delta": {
+                        "stop_reason": "tool_use" if tool_calls else "end_turn",
+                        "stop_sequence": None,
+                    },
+                    "usage": {
+                        "input_tokens": prompt_tokens,
+                        "output_tokens": total,
+                    },
+                },
+                ensure_ascii=False,
+            )
+        )
+        self._sse(json.dumps({"type": "message_stop"}, ensure_ascii=False))
 
     # ---- helpers ----
 
@@ -1895,6 +3349,9 @@ def main():
             flush=True,
         )
     print("  POST /v1/chat/completions  (OpenAI 互換, stream/non-stream)", flush=True)
+    print("  POST /v1/completions       (OpenAI テキスト補完)", flush=True)
+    print("  POST /v1/responses         (OpenAI Responses API)", flush=True)
+    print("  POST /v1/messages          (Anthropic 互換)", flush=True)
     print("  GET  /v1/models", flush=True)
     print("", flush=True)
     print("  Claude Code 設定例 (~/.clauderc.json または claude.json):", flush=True)
