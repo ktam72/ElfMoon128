@@ -46,6 +46,7 @@ from mlx_lm.utils import load_model
 from mlx_lm.sample_utils import make_sampler, make_logits_processors
 from mlx_lm.models.cache import make_prompt_cache
 from stream_model import MODELS_ROOT, list_models, resolve_model, wire_streaming
+from lookup_gen import stream_generate_lookup
 from pathlib import Path
 
 SYSTEM = "You are an expert coding assistant. Write clean, correct, concise code."
@@ -93,6 +94,8 @@ PREFILL_STEP = int(os.environ.get("ELFMOON_PREFILL_STEP", "4096"))
 KVC = os.environ.get("ELFMOON_KVC", "1") != "0"
 # 対話 CLI では KVC の情報ログがプロンプト表示に割り込むため既定で抑制（エラーは出る）
 os.environ.setdefault("ELFMOON_KVC_LOG", "0")
+# prompt-lookup 投機デコード。temp=0（貪欲）時のみ有効。ELFMOON_LOOKUP=0 で無効。
+LOOKUP = os.environ.get("ELFMOON_LOOKUP", "1") != "0"
 
 
 def _read_utf8_char(fd):
@@ -899,6 +902,7 @@ def main():
             if _lp:
                 _gen_kwargs["logits_processors"] = _lp
             _kvc_save_ids, _kvc_snap = None, None
+            _lk_stats = [(0, 0)]  # prompt-lookup: (blocks, accepted)
             if KVC:
                 # 会話履歴部分の KV を再利用し、毎ターンの全履歴再プレフィルを回避する。
                 # 失敗時は従来経路にフォールバック（会話は止めない）。
@@ -928,11 +932,19 @@ def main():
                     _prefill_t0 = time.perf_counter()
                     if cached_len < boundary:
                         remaining = prompt_ids[cached_len:boundary]
+                        # チャンク境界ごとに退避点を記録（履歴の中盤書き換え時に
+                        # 共通 prefix まで巻き戻して再利用するため）。
+                        kv_manager.set_live_cache(prompt_cache)
+                        kv_manager._session_tokens = list(prompt_ids[:cached_len])
+                        _acc = cached_len
                         for ci in range(0, len(remaining), PREFILL_STEP):
+                            chunk = remaining[ci : ci + PREFILL_STEP]
                             model(
-                                mx.array([remaining[ci : ci + PREFILL_STEP]]),
+                                mx.array([chunk]),
                                 cache=prompt_cache,
                             )
+                            _acc += len(chunk)
+                            kv_manager.add_snapshot(prompt_cache, _acc)
                         _kvc_snap = kv_manager.snapshot(prompt_cache)
                         _kvc_save_ids = prompt_ids[:boundary]
                     if cached_len:
@@ -941,6 +953,8 @@ def main():
                             end="",
                             flush=True,
                         )
+                    kv_manager.set_live_cache(prompt_cache)
+                    kv_manager._session_tokens = list(prompt_ids[:boundary])
                     _gen_kwargs.update(
                         prompt=prompt_ids[boundary:], prompt_cache=prompt_cache
                     )
@@ -951,7 +965,36 @@ def main():
                 prompt_ids = tok.encode(prompt) if isinstance(prompt, str) else prompt
                 _prefill_n = len(prompt_ids) if isinstance(prompt_ids, list) else 0
                 _prefill_t0 = time.perf_counter()
-            generator = stream_generate(**_gen_kwargs)
+            # prompt-lookup 投機デコード: temp=0（貪欲）時のみ出力が通常経路と
+            # 等価になるため、そのときだけ使用する。prompt はトークン列 + 既存の
+            # prompt_cache（KVC から復元）を前提とする。
+            _use_lookup = (
+                LOOKUP
+                and state["temp"] == 0.0
+                and isinstance(_gen_kwargs.get("prompt"), list)
+                and _gen_kwargs.get("prompt_cache") is not None
+            )
+            if _use_lookup:
+                from kv_manager import kv_manager as _kvm
+
+                _lk_prompt = _gen_kwargs["prompt"]
+                _lk_cache = _gen_kwargs["prompt_cache"]
+                if not isinstance(_lk_prompt, list):
+                    _lk_prompt = tok.encode(_lk_prompt)
+                generator = stream_generate_lookup(
+                    model=model,
+                    tokenizer=tok,
+                    prompt=_lk_prompt,
+                    max_tokens=state["max_tokens"],
+                    sampler=_sampler,
+                    logits_processors=_lp,
+                    prompt_cache=_lk_cache,
+                    prefill_step_size=PREFILL_STEP,
+                    enable_lookup=True,
+                    kv_manager=_kvm if KVC else None,
+                )
+            else:
+                generator = stream_generate(**_gen_kwargs)
 
             # Thinking専用モデル: template がプロンプト側に <think> を置き
             # 出力に開きタグが現れないため、最初から think 内として扱う
@@ -974,6 +1017,11 @@ def main():
                     if esc_mon.cancelled:
                         return
                     n_raw[0] += 1
+                    # prompt-lookup の統計（LookupOut のみが持つ）
+                    _lk_stats[0] = (
+                        getattr(out, "lookup_blocks", 0),
+                        getattr(out, "lookup_accepted", 0),
+                    )
                     yield out.text
 
             if _in_think:
@@ -1052,8 +1100,13 @@ def main():
         think_info = f"思考 {think_s:.1f}s ／ " if think_s > 0 else ""
         _n_raw = n_raw[0] if n_raw else 0
         _tps = (_n_raw / elapsed) if elapsed > 0 else 0.0
+        _lk_info = ""
+        if _lk_stats and _lk_stats[0][0] > 0:
+            _blk, _acc = _lk_stats[0]
+            _lk_info = f" ／ lookup {_blk}ブロック 受容{_acc}"
         print(
-            f"\n\033[2m（{think_info}{pf_info}decode {_n_raw} tokens, {_tps:.1f} tok/s{hit}）\033[0m"
+            f"\n\033[2m（{think_info}{pf_info}decode {_n_raw} tokens, {_tps:.1f} tok/s{hit}"
+            f"{_lk_info}）\033[0m"
         )
         messages.append({"role": "assistant", "content": resp})
 

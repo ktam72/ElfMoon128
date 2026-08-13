@@ -25,14 +25,21 @@ from collections import OrderedDict
 from typing import Any
 
 import mlx.core as mx
-from mlx_lm.models.cache import ArraysCache, KVCache
+from mlx_lm.models.cache import ArraysCache, KVCache, trim_prompt_cache
 
 DISK_CACHE_DIR = os.environ.get("ELFMOON_KV_CACHE_DIR") or os.path.expanduser(
     "~/.cache/elfmoon/kv_cache"
 )
 MAX_DISK_ENTRIES = 4
 MIN_SAVE_TOKENS = 20
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
+# 退避点（rewind point）関連。
+# 会話履歴の**中盤**が書き換わる場合（tool_result 再描画・履歴圧縮・system 追記等）、
+# 完全プレフィックス一致では再利用不可になる。prefill のチャンク境界ごとに
+# 再帰状態（ArraysCache、trim 不可）を退避しておき、共通 prefix まで巻き戻して再利用する。
+# 退避点は「trim できない層の状態」だけで持つ（KV は trim_prompt_cache で戻せる）。
+SNAPSHOT_MAX = int(os.environ.get("ELFMOON_SNAPSHOTS", "24"))
+SNAPSHOT_TAIL = int(os.environ.get("ELFMOON_SNAPSHOT_TAIL", "256"))
 # 情報ログ（hit/save 等）。対話 CLI ではプロンプト表示に割り込むため抑制できる。
 # エラーログは本フラグに関わらず常に出す。
 KVC_LOG = os.environ.get("ELFMOON_KVC_LOG", "1") != "0"
@@ -72,6 +79,13 @@ class KVCacheManager:
         self._namespace = b""
         os.makedirs(self._dir, exist_ok=True)
         self._purge_old_format()
+        # 現セッションの巻き戻し用状態（中盤書き換え時の部分再利用に使う）。
+        # _session_tokens: 現セッションでキャッシュに投入済みのトークン列
+        # _snaps: [(pos, arrays_state)] 退避点。pos はトークン列内の絶対位置。
+        # _live_cache: 現セッションの実キャッシュ（巻き戻しはこれに対して行う）。
+        self._session_tokens: list[int] = []
+        self._snaps: list[tuple[int, Any]] = []
+        self._live_cache: list[Any] | None = None
 
     def set_namespace(self, name: str):
         """キャッシュキーの名前空間（モデル識別子）を設定する。
@@ -80,6 +94,120 @@ class KVCacheManager:
         衝突し KV 形状不一致でクラッシュする。モデルパス等を渡して分離すること。
         """
         self._namespace = name.encode()
+
+    # ---- 退避点（rewind points） ----
+
+    @staticmethod
+    def _arrays_state(cache: list[Any]) -> list[tuple[int, Any]]:
+        """trim できない層（ArraysCache）の状態だけを取り出す。
+
+        KV（KVCache）は trim_prompt_cache で巻き戻せるため退避対象にしない。
+        """
+        return [
+            (i, [mx.array(x) for x in c.state])
+            for i, c in enumerate(cache)
+            if isinstance(c, ArraysCache)
+        ]
+
+    def begin_session(self, tokens: list[int], cache: list[Any] | None = None):
+        """新セッションを開始する。退避点を蓄積するためのトークン列を設定する。"""
+        self._session_tokens = list(tokens)
+        self._snaps = []
+        self._live_cache = cache
+        if cache is not None:
+            self.add_snapshot(cache, len(tokens))
+
+    def add_snapshot(self, cache: list[Any], pos: int):
+        """prefill チャンク境界で退避点を記録する（ArraysCache 状態のみ）。
+
+        最大 SNAPSHOT_MAX 個まで保持し、位置が均等になるよう間引く。
+        末尾近く（SNAPSHOT_TAIL より手前）には必ず 1 個残す。
+        """
+        arrays = self._arrays_state(cache)
+        if not arrays:
+            return
+        self._snaps.append((pos, arrays))
+        while len(self._snaps) > max(1, SNAPSHOT_MAX):
+            if len(self._snaps) <= 2:
+                del self._snaps[0]
+                continue
+            # 隣接間隔がもっとも狭い点を落として位置の分布を均す（末尾は残す）
+            drop, gap = 1, None
+            for i in range(1, len(self._snaps) - 1):
+                g = self._snaps[i + 1][0] - self._snaps[i - 1][0]
+                if gap is None or g < gap:
+                    gap, drop = g, i
+            del self._snaps[drop]
+
+    def _restore_cache(self, cache: list[Any], snap, cur_pos: int) -> bool:
+        """退避点位置まで cache を巻き戻す。成功したら True。
+
+        ArraysCache（再帰状態）は退避参照に戻し、KV は trim 可能層だけ
+        trim_prompt_cache で切り詰める（混在キャッシュでは全層 trim は失敗する）。
+        """
+        back = cur_pos - snap[0]
+        if back < 0:
+            return False
+        if back > 0:
+            trimmable = [c for c in cache if c.is_trimmable()]
+            if trim_prompt_cache(trimmable, back) != back:
+                return False
+        for i, state in snap[1]:
+            cache[i].state = state
+        return True
+
+    def common_prefix_len(self, cached: list[int], prompt: list[int]) -> int:
+        """2 つのトークン列の一致する先頭長を返す。"""
+        n = min(len(cached), len(prompt))
+        i = 0
+        while i < n and cached[i] == prompt[i]:
+            i += 1
+        return i
+
+    def rewind_to(self, cache: list[Any], prompt_ids: list[int]):
+        """現セッションの退避点を利用して共通 prefix まで巻き戻す。
+
+        共通 prefix 以下で最も新しい退避点まで戻り、その位置を返す。
+        巻き戻せなければ 0（全捨て）を返す。
+        """
+        if not self._session_tokens:
+            return 0
+        common = self.common_prefix_len(self._session_tokens, prompt_ids)
+        if common <= 0:
+            return 0
+        usable = [s for s in self._snaps if 0 < s[0] <= common]
+        if not usable:
+            return 0
+        snap = max(usable, key=lambda s: s[0])
+        if not self._restore_cache(cache, snap, len(self._session_tokens)):
+            return 0
+        # 巻き戻した位置より後ろの退避点は無効になる
+        self._snaps = [s for s in self._snaps if s[0] <= snap[0]]
+        self._session_tokens = list(prompt_ids[: snap[0]])
+        self._live_cache = cache
+        return snap[0]
+
+    def set_live_cache(self, cache: list[Any]):
+        """現セッションの実キャッシュを登録する（巻き戻し対象）。"""
+        self._live_cache = cache
+
+    def live_rewind(self, prompt_ids: list[int]) -> tuple[list[Any] | None, int]:
+        """保持中の実キャッシュを共通 prefix まで巻き戻して返す。
+
+        戻り値は (cache, rewind_pos)。巻き戻せなければ (None, 0)。
+        """
+        cache = self._live_cache
+        if cache is None or not self._session_tokens:
+            return None, 0
+        pos = self.rewind_to(cache, prompt_ids)
+        if pos <= 0:
+            return None, 0
+        return cache, pos
+
+    def mark_fed(self, tokens: list[int]):
+        """キャッシュに投入済みのトークン列を現セッションに反映する（生成後）。"""
+        self._session_tokens = list(tokens)
+        self._snaps = [s for s in self._snaps if s[0] <= len(tokens)]
 
     # ---- hash ----
 
@@ -120,6 +248,13 @@ class KVCacheManager:
 
     def lookup(self, prompt_ids: list[int], model) -> tuple[list[Any] | None, int]:
         n_layers = len(getattr(model, "layers", None) or model.model.layers)
+
+        # 0) 現セッションの退避点による部分再利用（履歴の中盤書き換え対応）。
+        #    完全一致（下記 1/2）が無い場合でも、共通 prefix 以下で最も新しい
+        #    退避点まで巻き戻して再利用できる。
+        cache, pos = self.live_rewind(prompt_ids)
+        if cache is not None:
+            return cache, pos
 
         # 1) メモリ: 一致する中で最長 offset のエントリ
         best_key = None
@@ -165,19 +300,36 @@ class KVCacheManager:
                     file=sys.stderr,
                     flush=True,
                 )
-            return _build_cache_objects(offset, layer_data, n_layers), offset
+            # 復元したキャッシュを現セッションに登録し、退避点も読み戻す。
+            # 復元直後に会話の前方で分岐しても部分再利用できる。
+            restored = _build_cache_objects(offset, layer_data, n_layers)
+            self.set_live_cache(restored)
+            self._session_tokens = list(prompt_ids[:offset])
+            self._snaps = self._disk_load_snaps(key)
+            return restored, offset
 
         return None, 0
 
     # ---- save（メモリ＋ディスク） ----
 
-    def save(self, token_ids: list[int], snap: list[tuple[str, Any]] | None):
-        """snapshot() の捕捉状態を token_ids（処理済み全トークン）キーで保存する。"""
+    def save(
+        self,
+        token_ids: list[int],
+        snap: list[tuple[str, Any]] | None,
+        rewind_snaps: list[tuple[int, Any]] | None = None,
+    ):
+        """snapshot() の捕捉状態を token_ids（処理済み全トークン）キーで保存する。
+
+        rewind_snaps: 退避点リスト（(pos, arrays_state)）。ディスク保存時は
+        `.snaps.safetensors` に併せて永続化する。省略時は現セッションの退避点を使う。
+        """
         if snap is None:
             return
         offset = len(token_ids)
         if offset < MIN_SAVE_TOKENS:
             return
+        if rewind_snaps is None:
+            rewind_snaps = self._snaps
         key = self._hash_prefix(token_ids, offset)
         if key in self._caches and self._caches[key][0] == offset:
             # 同一内容が既にある → メモリ/ディスクとも書き直し不要
@@ -201,6 +353,11 @@ class KVCacheManager:
             else:
                 layer_data.append(("arr", data))
                 to_eval.extend(data)
+        # 退避点の配列もメインスレッドで実体化しておく（バックグラウンド保存
+        # スレッドには GPU ストリームが無く、lazy 配列は eval できないため）。
+        for _pos, _layers in rewind_snaps:
+            for _i, _state in _layers:
+                to_eval.extend(_state)
         mx.eval(to_eval)
 
         # メモリ
@@ -212,7 +369,7 @@ class KVCacheManager:
         # ディスク（バックグラウンド書込み: 応答終端をブロックしない）
         threading.Thread(
             target=self._disk_save,
-            args=(key, offset, layer_data, len(token_ids)),
+            args=(key, offset, layer_data, len(token_ids), rewind_snaps),
             daemon=True,
         ).start()
 
@@ -230,6 +387,7 @@ class KVCacheManager:
         offset: int,
         layer_data: list[tuple[str, Any]],
         prompt_length: int,
+        rewind_snaps: list[tuple[int, Any]] | None = None,
     ):
         try:
             with self._disk_lock:
@@ -250,6 +408,12 @@ class KVCacheManager:
                 if arrays:
                     mx.save_safetensors(self._disk_path(key), arrays)
 
+                # 退避点（ArraysCache 状態のみ）を別ファイルに保存する。
+                # 復元直後に会話の前方で分岐しても部分再利用できるようにするため。
+                snap_meta = None
+                if rewind_snaps:
+                    snap_meta = self._disk_save_snaps(key, rewind_snaps)
+
                 meta = {
                     "version": FORMAT_VERSION,
                     "hash": key,
@@ -259,6 +423,7 @@ class KVCacheManager:
                     "arr_indices": arr_indices,
                     "prompt_tokens": prompt_length,
                     "created_at": time.time(),
+                    "snaps": snap_meta,
                 }
                 with open(self._meta_path(key), "w") as f:
                     json.dump(meta, f)
@@ -268,12 +433,70 @@ class KVCacheManager:
             if KVC_LOG:
                 print(
                     f"[KVC] disk save: key={key[:12]} offset={offset} "
-                    f"kv={len(kv_indices)} arr={len(arr_indices)}/{len(layer_data)}",
+                    f"kv={len(kv_indices)} arr={len(arr_indices)}/{len(layer_data)}"
+                    + (f" snaps={len(rewind_snaps)}" if rewind_snaps else ""),
                     file=sys.stderr,
                     flush=True,
                 )
         except Exception as e:
             print(f"[KVC] disk save error: {e}", file=sys.stderr, flush=True)
+
+    def _snaps_path(self, key: str) -> str:
+        return os.path.join(self._dir, f"{key}.snaps.safetensors")
+
+    def _disk_save_snaps(self, key: str, snaps: list[tuple[int, Any]]) -> dict | None:
+        """退避点を `<key>.snaps.safetensors` に保存し、メタ情報を返す。
+
+        各退避点は (pos, [(layer_idx, [state, ...]), ...])。全層の ArraysCache
+        状態を保持すると大きいため、現行セッションの退避点に限定して保存する。
+        """
+        arrays: dict[str, mx.array] = {}
+        poss: list[int] = []
+        for k, (pos, layers) in enumerate(snaps):
+            poss.append(pos)
+            for i, state in layers:
+                for j, a in enumerate(state):
+                    arrays[f"{k}:{i}:{j}"] = a
+        if not arrays:
+            return None
+        # 配列はメインスレッドで既に実体化済み（save() 内で eval 済み）なので、
+        # バックグラウンドスレッドでは保存のみ行う。
+        # safetensors は拡張子を強制するため一時ファイルも同じ拡張子にする
+        tmp = self._snaps_path(key)[: -len(".safetensors")] + ".tmp.safetensors"
+        mx.save_safetensors(tmp, arrays, {"positions": ",".join(map(str, poss))})
+        os.replace(tmp, self._snaps_path(key))
+        return {"file": os.path.basename(self._snaps_path(key)), "positions": poss}
+
+    def _disk_load_snaps(self, key: str) -> list[tuple[int, Any]]:
+        """保存済み退避点を読み戻す（壊れていれば空リスト）。"""
+        path = self._snaps_path(key)
+        if not os.path.isfile(path):
+            return []
+        try:
+            arrays, md = mx.load(path, return_metadata=True)
+            poss = [int(x) for x in md.get("positions", "").split(",") if x]
+            grouped: dict[int, dict[int, dict[int, mx.array]]] = {}
+            for name, a in arrays.items():
+                k, i, j = (int(x) for x in name.split(":"))
+                grouped.setdefault(k, {}).setdefault(i, {})[j] = a
+            out: list[tuple[int, Any]] = []
+            for k, pos in enumerate(poss):
+                layers = grouped.get(k)
+                if not layers:
+                    continue
+                out.append(
+                    (
+                        pos,
+                        [
+                            (i, [d[j] for j in sorted(d)])
+                            for i, d in sorted(layers.items())
+                        ],
+                    )
+                )
+            return sorted(out, key=lambda s: s[0])
+        except Exception as exc:
+            print(f"[KVC] rewind load error: {exc}", file=sys.stderr, flush=True)
+            return []
 
     def _disk_load_arrays(self, key: str) -> list[tuple[str, Any]]:
         with open(self._meta_path(key)) as f:
@@ -349,7 +572,11 @@ class KVCacheManager:
             self._disk_delete(entry["hash"])
 
     def _disk_delete(self, key: str):
-        for path in [self._disk_path(key), self._meta_path(key)]:
+        for path in [
+            self._disk_path(key),
+            self._meta_path(key),
+            self._snaps_path(key),
+        ]:
             if os.path.exists(path):
                 os.remove(path)
 
@@ -357,6 +584,9 @@ class KVCacheManager:
 
     def clear(self):
         self._caches.clear()
+        self._session_tokens = []
+        self._snaps = []
+        self._live_cache = None
 
     def clear_disk(self):
         """Remove all disk cache entries."""
@@ -365,4 +595,3 @@ class KVCacheManager:
 
 
 kv_manager = KVCacheManager()
-
