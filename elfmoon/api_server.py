@@ -64,12 +64,15 @@ from mlx_lm.sample_utils import (
 )
 from stream_model import MODELS_ROOT, list_models, resolve_model, wire_streaming
 from tool_replay import ToolReplayStore, tool_replay_path
+from lookup_gen import LookupOut, stream_generate_lookup
 
 HOST = os.environ.get("ELFMOON_HOST", "127.0.0.1")
 DEFAULT_PORT = 11434
 DEFAULT_CAPACITY = None  # None=メモリ予算から自動導出
 MODEL_ID = "elfmoon"
-MAX_TOKENS = 16384
+# 出力トークン上限。思考型モデル（Nemotron 等）はリーズニング込みで長い応答になるため
+# 余裕を持たせる。クライアントが max_tokens 未指定時の既定値でもある。
+MAX_TOKENS = 65536
 TEMP = 0.6
 # プレフィルのチャンク幅。gather_qmm 経路では融合テンソル読込(~18GB/チャンク巡回)が
 # チャンク数に比例する固定費のため、大きいほど長プロンプトで有利。8192 は活性化で
@@ -456,7 +459,11 @@ def _coerce_legacy_value(raw: str):
 
 
 def _extract_legacy_tool_calls(text: str) -> tuple[str, list[dict]]:
-    """Laguna 形式（<tool_call>name<arg_key>...</arg_key>...</tool_call>）を抽出する。"""
+    """Laguna 形式（<tool_call>name<arg_key>...</arg_key>...</tool_call>）を抽出する。
+
+    Nemotron 形式（<tool_call>\n<function=name>\n<parameter=k>\nv\n</parameter>...</function>
+    </tool_call>）もここで扱う（`_parse_function_parameter_body` 参照）。
+    """
     if TOOL_CALL_LEGACY_START not in text:
         return text, []
     calls = []
@@ -478,6 +485,9 @@ def _extract_legacy_tool_calls(text: str) -> tuple[str, list[dict]]:
         parsed = _parse_tool_json_body(body)
         if parsed is None:
             parsed = _parse_legacy_tool_body(body)
+        if parsed is None:
+            # Nemotron 形式: <function=name>...<parameter=k>...</parameter>...</function>
+            parsed = _parse_function_parameter_body(body)
         if parsed is not None:
             calls.append(parsed)
             cleaned_parts.append("")
@@ -486,6 +496,45 @@ def _extract_legacy_tool_calls(text: str) -> tuple[str, list[dict]]:
         i = end + len(TOOL_CALL_LEGACY_END)
     cleaned = "".join(cleaned_parts).strip()
     return cleaned, calls
+
+
+def _parse_function_parameter_body(body: str) -> dict | None:
+    """Nemotron 形式のボディ <function=name>\n<parameter=k>\nv\n</parameter>...</function> を dict に変換する。
+
+    例:
+      <function=discover_projs>
+      <parameter=workspaceRoot>
+      .
+      </parameter>
+      </function>
+    """
+    m = re.search(r"<function=([^>\n]+)>", body)
+    if not m:
+        return None
+    name = m.group(1).strip()
+    args = {}
+    # <parameter=k>...</parameter> ブロックを全て抽出
+    for pm in re.finditer(r"<parameter=([^>\n]+)>(.*?)</parameter>", body, re.DOTALL):
+        key = pm.group(1).strip()
+        raw = pm.group(2)
+        # 前後の空行を除去（テンプレート描画では \n が含まれる）
+        val = raw.strip("\n")
+        args[key] = _coerce_legacy_value(val)
+    if not args and "<parameter=" not in body:
+        # 引数なし（関数名のみ）
+        return {
+            "id": f"call_{uuid.uuid4().hex[:12]}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(args, ensure_ascii=False),
+            },
+        }
+    return {
+        "id": f"call_{uuid.uuid4().hex[:12]}",
+        "type": "function",
+        "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+    }
 
 
 def _extract_section_tool_calls(text: str) -> tuple[str, list[dict]]:
@@ -684,9 +733,23 @@ def _contains_think(text: str) -> bool:
 
 _TOOL_START_MARKERS = ["<tool_call>", "<|tool_call|>", "<|tool_call>"]
 _TOOL_END_MARKERS = ["</tool_call>", "<tool_call|>", "<tool_call|>"]
-# tool 領域検出のための後ろ倒し文字数。最大マーカー長（<|tool_call|> = 13）より
-# 大きければ安全（Swift の firstToolMarkerOffset の -12 に相当）。
-_TOOL_LOOKAHEAD = 16
+
+
+def _pending_marker_len(text: str) -> int:
+    """text 末尾が tool 開始マーカーの途中かもしれない場合、その文字数を返す。
+
+    ストリーミング中に `<tool_` まで来た時点で content として送出してしまうと、
+    直後に完成したマーカーを取り消せない。そのため「マーカーの真プレフィックスに
+    一致する末尾」だけを送出保留する。固定長で後ろ倒しすると、マーカーが現れない
+    通常の回答でも末尾が欠落するため、必要最小限に絞る。
+    """
+    best = 0
+    for m in _TOOL_START_MARKERS:
+        for k in range(min(len(m) - 1, len(text)), best, -1):
+            if text.endswith(m[:k]):
+                best = k
+                break
+    return best
 
 
 def _first_tool_marker(text: str) -> int | None:
@@ -841,6 +904,8 @@ class GenerationEngine:
         self._model_type = ""
         self._model_name = ""
         self._tool_replay = ToolReplayStore(filepath=tool_replay_path(""))
+        # --no-think 起動時: クライアントが thinking 未指定なら思考無効（既定値）
+        self.default_no_think = False
 
         self._thread.start()
         self._ready.wait()
@@ -1239,7 +1304,9 @@ class GenerationEngine:
         detokenizer.reset()
         eos_ids = self._eos_ids()
         stripper = ThinkStripper() if no_think else None
-        # thinking 有効時は reasoning と content を分離してストリームする
+        # thinking 有効時は reasoning と content を分離してストリームする。
+        # Nemotron（nemotron_h）も chat_template が生成プロンプト末尾に <think>\n
+        # を付けるため、in_think=True で開始して </think> 以降を content とする。
         splitter = (
             ReasoningSplitter(in_think=prompt.rstrip().endswith("<think>"))
             if not no_think
@@ -1270,9 +1337,16 @@ class GenerationEngine:
         if cached_len < boundary:
             remaining = prompt_ids[cached_len:boundary]
             step = PREFILL_STEP
+            # チャンク境界ごとに退避点を記録（履歴の中盤書き換え時に共通 prefix
+            # まで巻き戻して再利用するため）。
+            kv_manager.set_live_cache(prompt_cache)
+            kv_manager._session_tokens = list(prompt_ids[:cached_len])
+            _acc = cached_len
             for i in range(0, len(remaining), step):
                 chunk = remaining[i : i + step]
                 model(mx.array([chunk]), cache=prompt_cache)
+                _acc += len(chunk)
+                kv_manager.add_snapshot(prompt_cache, _acc)
             snap = kv_manager.snapshot(prompt_cache)
             save_key_ids = prompt_ids[:boundary]
             print(
@@ -1280,25 +1354,71 @@ class GenerationEngine:
                 file=sys.stderr,
                 flush=True,
             )
+        kv_manager.set_live_cache(prompt_cache)
+        kv_manager._session_tokens = list(prompt_ids[:boundary])
 
         remaining_ids = prompt_ids[boundary:]
         if not remaining_ids:
             remaining_ids = [tokenizer.eos_token_id]
 
         generate_t = time.time()
-        generator = generate_step(
-            mx.array(remaining_ids),
-            model,
-            max_tokens=max_tokens,
-            sampler=sampler,
-            logits_processors=procs or None,
-            prompt_cache=prompt_cache,
-            prefill_step_size=PREFILL_STEP,
-        )
+        _ttft = None  # 最初のトークンが送出されるまでの時間（リクエスト受付から）
+        # prompt-lookup 投機デコード: 貪欲（temp=0）時のみ出力が通常経路と等価。
+        # 受容率が低いタスクでは lookup_gen 内部で自動フォールバックする。
+        if temperature == 0.0 and not stop_list and not no_think and not procs:
+            generator = stream_generate_lookup(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=remaining_ids,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                prompt_cache=prompt_cache,
+                prefill_step_size=PREFILL_STEP,
+                enable_lookup=True,
+                kv_manager=kv_manager,
+            )
+        else:
+            generator = generate_step(
+                mx.array(remaining_ids),
+                model,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                logits_processors=procs or None,
+                prompt_cache=prompt_cache,
+                prefill_step_size=PREFILL_STEP,
+            )
         n = 0
         _sent = 0
         try:
-            for token, _logprob in generator:
+            for _tok in generator:
+                # 最初の送出: TTFT（リクエスト受付から最初のトークン送出まで）
+                if _ttft is None:
+                    _ttft = time.time() - generate_t
+                # prompt-lookup 経路は LookupOut（.text に差分テキストを持つ）を
+                # yield する。detokenizer は lookup_gen 内部で管理済みのため、
+                # ここで add_token すると二重管理でテキストが壊れる。
+                # 通常経路（generate_step）は (token, logprobs) タプルを yield し、
+                # detokenizer 管理はこちらで行う。
+                if isinstance(_tok, LookupOut):
+                    piece = _tok.text
+                    if not piece:
+                        continue
+                    n += 1
+                    if stripper is not None:
+                        piece = stripper.feed(piece)
+                        if piece is None:
+                            continue
+                        yield (piece, n)
+                    elif splitter is not None:
+                        r, c = splitter.feed(piece)
+                        if r:
+                            yield {"reasoning": r}
+                        if c:
+                            yield (c, n)
+                    else:
+                        yield (piece, n)
+                    continue
+                token, _logprob = _tok
                 if token in eos_ids:
                     break
                 detokenizer.add_token(token)
@@ -1352,8 +1472,12 @@ class GenerationEngine:
             print(f"[ENGINE] error at token {n}: {e}", file=sys.stderr, flush=True)
             raise
         finally:
+            _elapsed = time.time() - generate_t
+            _ttft_ms = f"{_ttft * 1000:.0f}ms" if _ttft is not None else "n/a"
             print(
-                f"[ENGINE] done: {n} tokens in {time.time() - generate_t:.1f}s",
+                f"[ENGINE] done: {n} tokens in {_elapsed:.1f}s"
+                f" ({n / max(_elapsed, 1e-9):.1f} t/s)"
+                f" TTFT {_ttft_ms}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -1455,21 +1579,29 @@ class GenerationEngine:
             enable_thinking=not no_think,
         )
         prompt_ids = tokenizer.encode(prompt)
+        prompt_tokens = len(prompt_ids)
 
-        yield len(prompt_ids)
+        yield prompt_tokens
         # 動的プリフィル調整（1回目のみ）: 最終チャンクが小さくなりすぎないよう調整
         from stream_model import optimal_prefill_step
 
-        PREFILL_STEP = optimal_prefill_step(len(prompt_ids))
+        PREFILL_STEP = optimal_prefill_step(prompt_tokens)
         print(
-            f"[ENGINE] prompt={len(prompt_ids)}tok max_tokens={max_tokens} temp={temperature} tools={bool(tools)}",
+            f"[ENGINE] prompt={prompt_tokens}tok max_tokens={max_tokens} temp={temperature} tools={bool(tools)}",
             file=sys.stderr,
             flush=True,
         )
 
+        prefill_t = time.time()
         prompt_cache = make_prompt_cache(model)
         for i in range(0, len(prompt_ids), PREFILL_STEP):
             model(mx.array([prompt_ids[i : i + PREFILL_STEP]]), cache=prompt_cache)
+        # MLX は遅延評価のため、eval しないと prefill 時間が実質 0 になる
+        try:
+            mx.eval([c.state for c in prompt_cache])
+        except Exception:
+            pass
+        prefill_elapsed = time.time() - prefill_t
 
         sampler = make_sampler(**self._sampler_kwargs(temperature, top_p, top_k, min_p))
         remaining = prompt_ids[-1:] if prompt_ids else [tokenizer.eos_token_id]
@@ -1502,6 +1634,35 @@ class GenerationEngine:
             else:
                 yield (piece, count)
 
+        def _tool_scan_from(text: str) -> int | None:
+            """tool マーカーの探索を開始してよい位置。think ブロック中なら None。
+
+            思考中のモデルは tool_call の書式そのものについて言及する（「<tool_call>
+            の中に <function=...> を入れる」等）。これを本物の tool_call と取り違え
+            ると content の配信が止まり、偽の tool_call が組み立てられる。最終的な
+            `_extract_tool_calls` は think 除去後のテキストを見るので保護済みだが、
+            ストリーム中のラッチにも同じ保護が要る。
+            """
+            if splitter is None:
+                return 0
+            i = text.find(ReasoningSplitter._THINK_CLOSE)
+            if i == -1:
+                return None
+            return i + len(ReasoningSplitter._THINK_CLOSE)
+
+        def _tool_marker_at(text: str) -> int | None:
+            """think ブロックより後ろにある最初の tool 開始マーカー位置。"""
+            base = _tool_scan_from(text)
+            if base is None:
+                return None
+            rel = _first_tool_marker(text[base:])
+            return None if rel is None else base + rel
+
+        def _tool_done(text: str) -> bool:
+            """think ブロックより後ろで tool_call が閉じたか。"""
+            base = _tool_scan_from(text)
+            return base is not None and _tool_call_complete(text[base:])
+
         def _stop_cut(text: str) -> int | None:
             """stop_list のいずれかが text に現れる最初の位置。無ければ None。"""
             if not stop_list:
@@ -1518,7 +1679,9 @@ class GenerationEngine:
         def _flush_content(final: bool = False):
             """detokenizer.text の未送出部分を送出する。
 
-            tools 有効時は tool 開始マーカー以降を送出しない（後ろ倒し + 領域検出）。
+            tools 有効時は tool 開始マーカー以降を送出しない（保留 + 領域検出）。
+            final=True（生成終了後の最終 flush）では保留を解除する。これ以上
+            トークンは来ないため、部分マーカーとの取り違えは起こり得ない。
             """
             nonlocal _sent
             text = detokenizer.text
@@ -1529,12 +1692,12 @@ class GenerationEngine:
             if stop_at is not None:
                 limit = min(limit, stop_at)
             if tools and not tool_started:
-                marker = _first_tool_marker(text)
+                marker = _tool_marker_at(text)
                 if marker is not None:
                     limit = min(limit, marker)
-                else:
-                    # マーカーがまだ現れていない: 末尾 LOOKAHEAD 分は保留
-                    limit = min(limit, len(text) - _TOOL_LOOKAHEAD)
+                elif not final:
+                    # マーカーの途中かもしれない末尾だけを保留する
+                    limit = min(limit, len(text) - _pending_marker_len(text))
             if limit <= _sent:
                 return
             piece = _clean_token_artifacts(text[_sent:limit])
@@ -1545,6 +1708,7 @@ class GenerationEngine:
                 yield y
 
         generate_t = time.time()
+        _ttft = None  # 最初のトークンが送出されるまでの時間（リクエスト受付から）
         generator = generate_step(
             mx.array(remaining),
             model,
@@ -1556,24 +1720,42 @@ class GenerationEngine:
         stop_hit = False
         try:
             for token, _logprob in generator:
+                # 最初の送出: TTFT
+                if _ttft is None:
+                    _ttft = time.time() - generate_t
                 if token in eos_ids:
+                    # tool マーカー開始後、tool_call が未完のまま EOS が来ることが
+                    # ある（Nemotron が回答と tool_call を分けて生成する等）。この
+                    # 場合は tool_call を諦め、生成済み content を最後まで配信する。
+                    if (
+                        tools
+                        and tool_started
+                        and not _tool_done(detokenizer.text)
+                    ):
+                        tool_started = False
+                        for y in _flush_content(final=True):
+                            yield y
                     break
                 detokenizer.add_token(token)
                 n += 1
                 text = detokenizer.text
 
                 # tool 完了 or 停止文字列の検出
-                if tools and not tool_started and _first_tool_marker(text) is not None:
-                    tool_started = True
-                    # マーカー以降を送出しないため、まず現時点まで flush
+                if tools and not tool_started and _tool_marker_at(text) is not None:
+                    # マーカー以降を送出しないため、まず現時点まで flush する。
+                    # tool_started を立てる前に呼ぶこと（立てた後だと
+                    # _flush_content 内のマーカー位置カットが効かず、
+                    # <tool_call> 自体が content として漏れる）。
                     for y in _flush_content():
                         yield y
-                    if _tool_call_complete(text):
+                    tool_started = True
+                    if _tool_done(text):
                         break
                     continue
                 if tools and tool_started:
-                    if _tool_call_complete(text):
+                    if _tool_done(text):
                         break
+                    # EOS で未完了のまま終わる場合の救済は生成ループ先頭で行う
                     continue
                 if _stop_cut(text) is not None:
                     stop_hit = True
@@ -1587,14 +1769,33 @@ class GenerationEngine:
             raise
 
         elapsed = time.time() - generate_t
+        # TTFT はリクエスト受付から最初のトークンまで = prefill + 最初の decode
+        if _ttft is None:
+            ttft_ms = "n/a"
+        else:
+            ttft_ms = (
+                f"{(prefill_elapsed + _ttft) * 1000:.0f}ms"
+                f"(pf {prefill_elapsed * 1000:.0f}+dec {_ttft * 1000:.0f})"
+            )
+        pf_info = ""
+        if prefill_elapsed > 0 and prompt_tokens > 0:
+            pf_info = (
+                f" prefill {prompt_tokens}tok/{prefill_elapsed:.2f}s"
+                f"={prompt_tokens / prefill_elapsed:.0f}t/s"
+            )
         print(
             f"[ENGINE] stream {n} tokens in {elapsed:.1f}s"
-            f" ({n / max(elapsed, 1e-9):.1f} t/s)",
+            f" ({n / max(elapsed, 1e-9):.1f} t/s)"
+            f"{pf_info} TTFT {ttft_ms}",
             file=sys.stderr,
             flush=True,
         )
 
-        # 残りの未送出分（stop 前 / tool 未開始時のみ全文送出）
+        # 残りの未送出分（stop で打ち切った場合は送出済み）。
+        # tool_call が未完のまま生成上限に達した場合も、tool_call を諦めて
+        # 生成済み content を配信する（content が丸ごと落ちるのを防ぐ）。
+        if tools and tool_started and not _tool_done(detokenizer.text):
+            tool_started = False
         if not stop_hit and not (tools and tool_started):
             for y in _flush_content(final=True):
                 yield y
@@ -1610,7 +1811,9 @@ class GenerationEngine:
 
         if tools:
             clean_text, tool_calls = _extract_tool_calls(content_text)
-            if not tool_calls and "tool_call" in output_text.lower():
+            # think ブロック内でモデルが tool_call の書式について言及するのは正常。
+            # 警告は本文（think 除去後）にマーカーが残った場合のみ出す。
+            if not tool_calls and _first_tool_marker(content_text) is not None:
                 print(
                     f"[ENGINE] ⚠️ tool_call らしき出力を抽出できず（マーカー要確認）: "
                     f"{output_text[:240]!r}",
@@ -1630,6 +1833,10 @@ class GenerationEngine:
                 self._tool_replay.persist()
             # content はストリーム送出済みのため dict では渡さない
             yield {"tool_calls": tool_calls}
+        elif not stop_hit and n >= max_tokens:
+            # 生成上限で打ち切られた。finish_reason=stop のままだとクライアントは
+            # 回答が完結したと解釈してしまうため、length を通知する。
+            yield {"finish_reason": "length"}
         return
 
 
@@ -1727,9 +1934,16 @@ class APIHandler(BaseHTTPRequestHandler):
         max_completion_tokens = body.get("max_completion_tokens")
         if max_completion_tokens is not None:
             max_tokens = min(max_completion_tokens, MAX_TOKENS)
-        thinking = _reasoning_enabled(
-            body.get("thinking"), body.get("think"), body.get("reasoning_effort")
-        )
+        # --no-think 起動時は thinking 未指定のとき思考無効を既定にする。
+        # クライアントが明示指定した場合はそれを優先する。
+        if body.get("thinking") is None and body.get("think") is None:
+            thinking = not _get_engine().default_no_think
+        else:
+            thinking = _reasoning_enabled(
+                body.get("thinking"),
+                body.get("think"),
+                body.get("reasoning_effort"),
+            )
         return {
             "max_tokens": max_tokens,
             "temperature": body.get("temperature", self._default_temp()),
@@ -1753,13 +1967,16 @@ class APIHandler(BaseHTTPRequestHandler):
 
         戻り値: (tools, tool_choice_none)
         - tool_choice == "none" → tools を無効化
-        - tools 未指定 → MCP ツールがあれば注入
+        - tools 未指定 → MCP ツールがあれば注入（ELFMOON_MCP_AUTO=0 で無効化）
+        - ELFMOON_TOOLS=0 → ツールを全面的に無効化（切り分け用）
         """
+        if os.environ.get("ELFMOON_TOOLS") == "0":
+            return None, False
         tools = body.get("tools")
         tool_choice = body.get("tool_choice", "auto")
         if isinstance(tool_choice, str) and tool_choice.lower() == "none":
             return None, True
-        if tools is None:
+        if tools is None and os.environ.get("ELFMOON_MCP_AUTO", "1") != "0":
             mcp_tools = mcp_manager.get_openai_tools()
             if mcp_tools:
                 tools = mcp_tools
@@ -1813,6 +2030,24 @@ class APIHandler(BaseHTTPRequestHandler):
         p = self._common_params(body)
         messages = _normalize_messages(messages)
         tools, _none = self._tools_for(body, messages)
+
+        # Nemotron + ツール有効時: 回答文を先に完結させてから tool_call するよう
+        # システムプロンプトで指示する（回答の途切れ対策）。
+        if (
+            tools
+            and _get_engine()._model_type == "nemotron_h"
+            and os.environ.get("ELFMOON_NEMOTRON_GUIDANCE") != "0"
+        ):
+            _guidance = (
+                "\n\n【出力規約】ツールを使う場合も、まずユーザーへの回答文を"
+                "最後まで書き切ってから tool_call を1回だけ出力してください。"
+                "回答文を途中で打ち切って tool_call に切り替えないでください。"
+            )
+            if messages and messages[0].get("role") == "system":
+                messages[0] = dict(messages[0])
+                messages[0]["content"] = (messages[0].get("content") or "") + _guidance
+            else:
+                messages.insert(0, {"role": "system", "content": _guidance.strip()})
 
         # ツールなし → 従来通り API ハンドラ側で prompt レンダリング（高速パス）
         # ツールあり → エンジンに messages + tools を渡してループ処理
@@ -2212,6 +2447,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     )
                     finish_reason = "tool_calls"
                     continue
+                if isinstance(msg, dict) and "finish_reason" in msg:
+                    finish_reason = msg["finish_reason"]
+                    continue
                 piece, n = msg
                 chunk = {
                     "id": completion_id,
@@ -2305,6 +2543,7 @@ class APIHandler(BaseHTTPRequestHandler):
             reasoning_effort=reasoning_effort,
         )
         tool_calls = None
+        length_capped = False
         try:
             for msg in gen:
                 if isinstance(msg, int):
@@ -2315,6 +2554,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     continue
                 if isinstance(msg, dict) and "tool_calls" in msg:
                     tool_calls = msg["tool_calls"]
+                    continue
+                if isinstance(msg, dict) and "finish_reason" in msg:
+                    length_capped = msg["finish_reason"] == "length"
                     continue
                 piece, n = msg
                 pieces.append(piece)
@@ -2340,7 +2582,7 @@ class APIHandler(BaseHTTPRequestHandler):
             finish_reason = "tool_calls"
         else:
             message = {"role": "assistant", "content": "".join(pieces)}
-            finish_reason = "stop"
+            finish_reason = "length" if length_capped else "stop"
         if reasoning_parts:
             message["reasoning_content"] = "".join(reasoning_parts)
         resp = {
@@ -3317,6 +3559,7 @@ def main():
         return
 
     perf = "--perf" in argv or os.environ.get("ELFMOON_PERF") == "1"
+    no_think = "--no-think" in argv
     model_name = None
     if "--model" in argv:
         idx = argv.index("--model")
@@ -3339,6 +3582,7 @@ def main():
     t0 = time.perf_counter()
 
     engine = GenerationEngine(model_path, store_dir, cap, perf)
+    engine.default_no_think = no_think
 
     print(f"準備完了（{time.perf_counter() - t0:.0f}秒）", flush=True)
     print("", flush=True)
